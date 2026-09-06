@@ -199,6 +199,21 @@ pub struct NodeArgs {
     #[arg(long = "feed-source", value_name = "IP=COUNT", action = clap::ArgAction::Append)]
     feed_sources: Vec<feed::FeedSourceSpec>,
 
+    /// Spare local source addresses. A source-bound lane whose duplicate lag (behind the winning
+    /// lane) stays at or above `--feed-rotate-lag-ms` for a whole `--feed-rotate-window-secs` is
+    /// rebound to the next spare; its old address returns to the pool. The relay assigns replicas
+    /// per source IP, so each address is an independent lottery ticket.
+    #[arg(long = "feed-spare-ip", value_name = "IP", action = clap::ArgAction::Append)]
+    feed_spare_ips: Vec<std::net::IpAddr>,
+
+    /// Rolling median duplicate lag, in milliseconds, at or above which a lane is rotated.
+    #[arg(long = "feed-rotate-lag-ms", value_name = "MS", default_value_t = 30)]
+    feed_rotate_lag_ms: u64,
+
+    /// Seconds a lane must stay slow before it rotates; also its cooldown after a rotation.
+    #[arg(long = "feed-rotate-window-secs", value_name = "SECS", default_value_t = 600)]
+    feed_rotate_window_secs: u64,
+
     /// Skip the L1-derivation catch-up loop, making `--feed-url` the sole block source. Genesis is
     /// still bootstrapped from `--l1-rpc` (chain id, spec, initial L1 base fee). Use this to follow a
     /// chain purely through its sequencer feed: the driver applies each feed message as the next
@@ -712,17 +727,53 @@ pub async fn run(ctx: CliContext, args: NodeArgs) -> eyre::Result<()> {
             + 1;
         let resume_sequence = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(feed_start_seq));
         let (ingress_tx, ingress_rx) = feed::ingress_channel();
+        // Lane rotation: bound lanes get a command channel; the coordinator re-deals a lane's
+        // source address when it stays persistently behind the winner.
+        let mut lane_receivers: Vec<Option<tokio::sync::mpsc::Receiver<std::net::IpAddr>>> =
+            Vec::with_capacity(feed_sources.len());
+        let rotation = (!args.feed_spare_ips.is_empty()).then(|| {
+            let mut lanes = Vec::with_capacity(feed_sources.len());
+            for source in &feed_sources {
+                if source.is_bound() {
+                    let (tx, rx) = feed::rotation_channel();
+                    lanes.push(Some(tx));
+                    lane_receivers.push(Some(rx));
+                } else {
+                    lanes.push(None);
+                    lane_receivers.push(None);
+                }
+            }
+            feed::Rotation {
+                pool: feed::RotationPool::new(args.feed_spare_ips.clone()),
+                policy: feed::RotationPolicy {
+                    lag: std::time::Duration::from_millis(args.feed_rotate_lag_ms),
+                    window: std::time::Duration::from_secs(args.feed_rotate_window_secs),
+                    min_samples: 200,
+                },
+                lanes,
+            }
+        });
+        let rotation_pool = rotation.as_ref().map(|rotation| rotation.pool.clone());
         task_executor.spawn_task(feed::coordinate(
             ingress_rx,
             feed_tx.clone(),
             feed_latency,
             resume_sequence.clone(),
+            rotation,
         ));
-        for source in feed_sources {
+        for (index, source) in feed_sources.into_iter().enumerate() {
+            let lane = match (
+                rotation_pool.as_ref(),
+                lane_receivers.get_mut(index).and_then(Option::take),
+            ) {
+                (Some(pool), Some(rx)) => Some((pool.clone(), rx)),
+                _ => None,
+            };
             task_executor.spawn_task(feed::follow(
                 source,
                 ingress_tx.clone(),
                 resume_sequence.clone(),
+                lane,
             ));
         }
     }

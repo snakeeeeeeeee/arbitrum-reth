@@ -143,6 +143,8 @@ async fn stream_client(mut stream: UnixStream, mut events: broadcast::Receiver<A
 const FRAME_VERSION: u8 = 2;
 const FIXED_BODY_LEN: usize = 96;
 const MAX_LOG_TOPICS: usize = 4;
+/// Fixed bytes of one kind-4 manifest entry before its calldata: 20-byte `to` + u32 length.
+const FEED_TX_ENTRY_PREFIX_LEN: usize = 24;
 
 fn encode_event(event: &ArbTxLogEvent) -> Result<Vec<u8>> {
     let log_count = u32::try_from(event.logs.len())
@@ -159,6 +161,26 @@ fn encode_event(event: &ArbTxLogEvent) -> Result<Vec<u8>> {
             .checked_add(25 + topics.len() * B256::len_bytes() + data_len as usize)
             .ok_or_else(|| eyre::eyre!("MEV transaction-log frame length overflow"))?;
     }
+    // Kind 4 reuses the fixed prefix and appends `(to, calldata)` entries in place of logs. Keep
+    // the frame unambiguous: a manifest never carries logs, no other kind carries entries, and the
+    // entry count in the `transactionIndex` slot must match what follows.
+    let is_feed_txs = matches!(event.kind, ArbTxExecutionKind::FeedTxs);
+    if is_feed_txs && !event.logs.is_empty() {
+        bail!("MEV feed-transactions event must not carry logs")
+    }
+    if !is_feed_txs && !event.feed_txs.is_empty() {
+        bail!("MEV transaction-log event must not carry feed transactions")
+    }
+    if is_feed_txs && event.transaction_index != event.feed_txs.len() as u64 {
+        bail!("MEV feed-transactions event count does not match its entries")
+    }
+    for (_, calldata) in &event.feed_txs {
+        let calldata_len = u32::try_from(calldata.len())
+            .map_err(|_| eyre::eyre!("MEV feed-transactions calldata exceeds 4 GiB"))?;
+        body_len = body_len
+            .checked_add(FEED_TX_ENTRY_PREFIX_LEN + calldata_len as usize)
+            .ok_or_else(|| eyre::eyre!("MEV transaction-log frame length overflow"))?;
+    }
     let frame_len = u32::try_from(body_len)
         .map_err(|_| eyre::eyre!("MEV transaction-log frame exceeds 4 GiB"))?;
 
@@ -169,6 +191,8 @@ fn encode_event(event: &ArbTxLogEvent) -> Result<Vec<u8>> {
         ArbTxExecutionKind::StartBlock => 0,
         ArbTxExecutionKind::User => 1,
         ArbTxExecutionKind::ScheduledRetry => 2,
+        ArbTxExecutionKind::EndBlock => 3,
+        ArbTxExecutionKind::FeedTxs => 4,
     });
     encoded.push(u8::from(event.success));
     encoded.push(0); // Reserved for future flags.
@@ -189,6 +213,13 @@ fn encode_event(event: &ArbTxLogEvent) -> Result<Vec<u8>> {
             encoded.extend_from_slice(topic.as_slice());
         }
         encoded.extend_from_slice(&log.data.data);
+    }
+    for (to, calldata) in &event.feed_txs {
+        encoded.extend_from_slice(to.as_slice());
+        let calldata_len = u32::try_from(calldata.len())
+            .expect("validated while calculating MEV transaction-log frame length");
+        encoded.extend_from_slice(&calldata_len.to_be_bytes());
+        encoded.extend_from_slice(calldata);
     }
     Ok(encoded)
 }
@@ -220,6 +251,7 @@ mod tests {
                     Bytes::from_static(&[0x12, 0x34]),
                 ),
             }],
+            feed_txs: Vec::new(),
         };
 
         let encoded = encode_event(&event).expect("event encodes");
@@ -242,6 +274,94 @@ mod tests {
         assert_eq!(encoded[120], 1);
         assert_eq!(u32::from_be_bytes(encoded[121..125].try_into().unwrap()), 2);
         assert_eq!(&encoded[157..159], [0x12, 0x34]);
+    }
+
+    #[test]
+    fn encodes_feed_transactions_manifest() {
+        let calldata_a = Bytes::from_static(&[0xa9, 0x05, 0x9c, 0xbb, 0x01]);
+        let calldata_b = Bytes::from_static(&[0xde, 0xad]);
+        let event = ArbTxLogEvent {
+            block_number: 42,
+            transaction_index: 2,
+            transaction_hash: B256::ZERO,
+            frontier_id: B256::ZERO,
+            kind: ArbTxExecutionKind::FeedTxs,
+            success: false,
+            gas_used: 0,
+            logs: Vec::new(),
+            feed_txs: vec![
+                (Address::repeat_byte(0x11), calldata_a.clone()),
+                // Contract creation: `to` is all zeros.
+                (Address::ZERO, calldata_b.clone()),
+            ],
+        };
+
+        let encoded = encode_event(&event).expect("event encodes");
+        // Length prefix + 96-byte fixed prefix + (24 + 5) + (24 + 2).
+        assert_eq!(encoded.len(), 4 + 96 + 29 + 26);
+        assert_eq!(
+            u32::from_be_bytes(encoded[..4].try_into().unwrap()) as usize,
+            encoded.len() - 4
+        );
+        assert_eq!(encoded[4], FRAME_VERSION);
+        assert_eq!(encoded[5], 4); // feed txs
+        assert_eq!(encoded[6], 0); // success
+        assert_eq!(encoded[7], 0); // flags
+        assert_eq!(u64::from_be_bytes(encoded[8..16].try_into().unwrap()), 42);
+        // Transaction count rides in the transactionIndex slot.
+        assert_eq!(u64::from_be_bytes(encoded[16..24].try_into().unwrap()), 2);
+        assert_eq!(u64::from_be_bytes(encoded[24..32].try_into().unwrap()), 0);
+        assert_eq!(&encoded[32..64], B256::ZERO.as_slice());
+        assert_eq!(&encoded[64..96], B256::ZERO.as_slice());
+        assert_eq!(u32::from_be_bytes(encoded[96..100].try_into().unwrap()), 0);
+        // Entry 0: to, calldata length, calldata.
+        assert_eq!(&encoded[100..120], Address::repeat_byte(0x11).as_slice());
+        assert_eq!(u32::from_be_bytes(encoded[120..124].try_into().unwrap()), 5);
+        assert_eq!(&encoded[124..129], calldata_a.as_ref());
+        // Entry 1.
+        assert_eq!(&encoded[129..149], Address::ZERO.as_slice());
+        assert_eq!(u32::from_be_bytes(encoded[149..153].try_into().unwrap()), 2);
+        assert_eq!(&encoded[153..155], calldata_b.as_ref());
+    }
+
+    #[test]
+    fn rejects_malformed_feed_transactions_events() {
+        let base = ArbTxLogEvent {
+            block_number: 42,
+            transaction_index: 1,
+            transaction_hash: B256::ZERO,
+            frontier_id: B256::ZERO,
+            kind: ArbTxExecutionKind::FeedTxs,
+            success: false,
+            gas_used: 0,
+            logs: Vec::new(),
+            feed_txs: vec![(Address::ZERO, Bytes::new())],
+        };
+        assert!(encode_event(&base).is_ok());
+
+        // The count in the transactionIndex slot must match the entries.
+        let mismatched = ArbTxLogEvent {
+            transaction_index: 2,
+            ..base.clone()
+        };
+        assert!(encode_event(&mismatched).is_err());
+
+        // A manifest never carries logs.
+        let with_logs = ArbTxLogEvent {
+            logs: vec![Log {
+                address: Address::ZERO,
+                data: LogData::new_unchecked(Vec::new(), Bytes::new()),
+            }],
+            ..base.clone()
+        };
+        assert!(encode_event(&with_logs).is_err());
+
+        // Only the manifest kind carries entries.
+        let wrong_kind = ArbTxLogEvent {
+            kind: ArbTxExecutionKind::User,
+            ..base
+        };
+        assert!(encode_event(&wrong_kind).is_err());
     }
 
     #[test]
@@ -268,6 +388,7 @@ mod tests {
                 address: Address::ZERO,
                 data: LogData::new_unchecked(vec![B256::ZERO; 5], Bytes::new()),
             }],
+            feed_txs: Vec::new(),
         };
 
         assert!(encode_event(&event).is_err());
@@ -289,6 +410,7 @@ mod tests {
             success: true,
             gas_used: 21_000,
             logs: Vec::new(),
+            feed_txs: Vec::new(),
         });
 
         let mut length = [0; 4];

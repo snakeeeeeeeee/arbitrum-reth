@@ -10,7 +10,7 @@ use std::{
 };
 
 use alloy_evm::EvmEnv;
-use alloy_primitives::{B256, Log, keccak256};
+use alloy_primitives::{Address, B256, Bytes, Log, keccak256};
 use arb_reth_evm::ArbBlockEnv;
 use arb_revm::{ArbChainContext, ArbSpecId};
 use revm::state::EvmState;
@@ -32,6 +32,14 @@ pub enum ArbTxExecutionKind {
     User,
     /// A retry scheduled by a preceding transaction in the same block.
     ScheduledRetry,
+    /// Synthetic marker published once all transactions of the block have executed (no logs).
+    /// Lets a colocated consumer finalize the block immediately instead of waiting for an idle timeout.
+    EndBlock,
+    /// Synthetic pre-execution manifest: the `to` address and calldata of every user transaction
+    /// the block will execute, in execution order. Published before the start-block transaction
+    /// runs, so a colocated consumer learns what the block contains before execution finishes.
+    /// Carries no hash, frontier, or logs; `transaction_index` holds the user-transaction count.
+    FeedTxs,
 }
 
 /// Logs and final execution status for one successfully included transaction.
@@ -57,6 +65,10 @@ pub struct ArbTxLogEvent {
     pub gas_used: u64,
     /// EVM logs emitted by the transaction. Reverted and halted transactions normally have none.
     pub logs: Vec<Log>,
+    /// `(to, calldata)` of every user transaction of the block, in execution order. Populated only
+    /// for [`ArbTxExecutionKind::FeedTxs`]; `to` is [`Address::ZERO`] for a contract creation.
+    /// Empty for every other kind.
+    pub feed_txs: Vec<(Address, Bytes)>,
 }
 
 #[derive(Debug)]
@@ -320,7 +332,6 @@ mod tests {
     #[test]
     fn frontier_deltas_are_retained_in_execution_order() {
         use alloy_evm::EvmEnv;
-        use alloy_primitives::Address;
         use revm::state::{Account, AccountInfo};
 
         let broadcaster = ArbTxLogBroadcaster::new();
