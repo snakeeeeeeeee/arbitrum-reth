@@ -9,12 +9,12 @@ use arbitrum_alloy_sequencer::sequencer::feed::{BroadcastFeedMessage, Root};
 use eyre::{Result, ensure, eyre};
 use metrics::{Counter, Gauge, Histogram};
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::{BTreeMap, BTreeSet, VecDeque},
     fmt,
     net::{IpAddr, SocketAddr},
     str::FromStr,
     sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicU64, Ordering},
     },
     time::{Duration, Instant},
@@ -42,6 +42,10 @@ const INITIAL_RECONNECT_DELAY: Duration = Duration::from_millis(250);
 const MAX_RECONNECT_DELAY: Duration = Duration::from_secs(8);
 const INITIAL_RATE_LIMIT_DELAY: Duration = Duration::from_secs(30);
 const MAX_RATE_LIMIT_DELAY: Duration = Duration::from_secs(300);
+/// Global floor between two lane rotations, so one bad minute cannot re-deal every ticket at once.
+const ROTATION_GLOBAL_COOLDOWN: Duration = Duration::from_secs(60);
+/// How often a lane's rolling lag is re-evaluated against the rotation policy.
+const ROTATION_CHECK_INTERVAL: Duration = Duration::from_secs(5);
 
 /// Counted source-address declaration accepted by `--feed-source IP=COUNT`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -92,6 +96,134 @@ impl fmt::Debug for FeedSource {
             .field("display_endpoint", &self.display_endpoint)
             .field("local_ip", &self.local_ip)
             .finish_non_exhaustive()
+    }
+}
+
+impl FeedSource {
+    /// Whether this lane binds a declared local address (only such lanes can rotate).
+    pub(crate) fn is_bound(&self) -> bool {
+        self.local_ip.is_some()
+    }
+}
+
+/// Spare local addresses a persistently slow lane can rotate onto. The relay assigns its replica
+/// per source IP, so every address is an independent lottery ticket; rotating a lane re-deals its
+/// ticket without touching the first-wins race.
+pub(crate) struct RotationPool {
+    spare: Mutex<VecDeque<IpAddr>>,
+    spare_size: Gauge,
+    rotations: Counter,
+}
+
+impl RotationPool {
+    pub(crate) fn new(spare: Vec<IpAddr>) -> Arc<Self> {
+        let size = spare.len() as f64;
+        let pool = Self {
+            spare: Mutex::new(spare.into_iter().collect()),
+            spare_size: metrics::gauge!("arb_reth.feed.rotation_spare_addresses"),
+            rotations: metrics::counter!("arb_reth.feed.rotations_total"),
+        };
+        pool.spare_size.set(size);
+        Arc::new(pool)
+    }
+
+    fn take(&self) -> Option<IpAddr> {
+        let mut spare = self.spare.lock().ok()?;
+        let ip = spare.pop_front();
+        self.spare_size.set(spare.len() as f64);
+        ip
+    }
+
+    fn give_back(&self, ip: IpAddr) {
+        if let Ok(mut spare) = self.spare.lock() {
+            spare.push_back(ip);
+            self.spare_size.set(spare.len() as f64);
+        }
+    }
+}
+
+/// When a bound lane's rolling median duplicate lag stays at or above `lag` for a full `window`
+/// (with at least `min_samples` duplicates), the coordinator hands it a spare address.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct RotationPolicy {
+    pub(crate) lag: Duration,
+    pub(crate) window: Duration,
+    pub(crate) min_samples: usize,
+}
+
+/// Coordinator-side rotation wiring: the spare pool, the policy, and one command channel per lane
+/// (`None` for OS-selected lanes, which have no address to rotate).
+pub(crate) struct Rotation {
+    pub(crate) pool: Arc<RotationPool>,
+    pub(crate) policy: RotationPolicy,
+    pub(crate) lanes: Vec<Option<mpsc::Sender<IpAddr>>>,
+}
+
+/// Create the coordinator-to-lane rotation command channel (one pending command is enough).
+pub(crate) fn rotation_channel() -> (mpsc::Sender<IpAddr>, mpsc::Receiver<IpAddr>) {
+    mpsc::channel(1)
+}
+
+/// Rolling duplicate-lag record of one lane, kept by the coordinator.
+struct LaneWatch {
+    lags_ms: VecDeque<(Instant, u32)>,
+    since: Instant,
+    last_check: Instant,
+}
+
+impl LaneWatch {
+    fn new(now: Instant) -> Self {
+        Self {
+            lags_ms: VecDeque::new(),
+            since: now,
+            last_check: now,
+        }
+    }
+
+    fn record(&mut self, now: Instant, lag: Duration, window: Duration) {
+        let ms = lag.as_millis().min(u128::from(u32::MAX)) as u32;
+        self.lags_ms.push_back((now, ms));
+        while self
+            .lags_ms
+            .front()
+            .is_some_and(|(at, _)| now.saturating_duration_since(*at) > window)
+        {
+            self.lags_ms.pop_front();
+        }
+    }
+
+    /// Median duplicate lag (ms) if the lane has been slow for a full window; `None` otherwise.
+    fn slow_median(&mut self, now: Instant, policy: &RotationPolicy) -> Option<u32> {
+        if now.saturating_duration_since(self.last_check) < ROTATION_CHECK_INTERVAL {
+            return None;
+        }
+        self.last_check = now;
+        if now.saturating_duration_since(self.since) < policy.window
+            || self.lags_ms.len() < policy.min_samples
+        {
+            return None;
+        }
+        let mut sorted: Vec<u32> = self.lags_ms.iter().map(|(_, ms)| *ms).collect();
+        sorted.sort_unstable();
+        let median = sorted[sorted.len() / 2];
+        (u128::from(median) >= policy.lag.as_millis()).then_some(median)
+    }
+
+    fn reset(&mut self, now: Instant) {
+        self.lags_ms.clear();
+        self.since = now;
+        self.last_check = now;
+    }
+}
+
+/// Resolve the next rotation command, or never for lanes that cannot rotate.
+async fn next_rotation(rx: &mut Option<mpsc::Receiver<IpAddr>>) -> IpAddr {
+    match rx {
+        Some(rx) => match rx.recv().await {
+            Some(ip) => ip,
+            None => std::future::pending().await,
+        },
+        None => std::future::pending().await,
     }
 }
 
@@ -184,6 +316,7 @@ pub(crate) fn expand_feed_sources(
 }
 
 pub(crate) struct FeedIngress {
+    ordinal: usize,
     message: BroadcastFeedMessage,
     frame_received_at: Instant,
     ready_for_channel_at: Instant,
@@ -298,8 +431,13 @@ pub(crate) async fn coordinate(
     output: mpsc::Sender<BroadcastFeedMessage>,
     feed_latency: FeedLatencyTracker,
     resume_sequence: Arc<AtomicU64>,
+    mut rotation: Option<Rotation>,
 ) {
     let mut race = SequenceRace::new(resume_sequence.load(Ordering::Acquire));
+    let started = Instant::now();
+    let lane_count = rotation.as_ref().map_or(0, |r| r.lanes.len());
+    let mut watches: Vec<LaneWatch> = (0..lane_count).map(|_| LaneWatch::new(started)).collect();
+    let mut last_rotation: Option<Instant> = None;
     while let Some(item) = ingress.recv().await {
         let sequence = item.message.sequence_number;
         match race.observe(sequence, item.ready_for_channel_at) {
@@ -324,11 +462,40 @@ pub(crate) async fn coordinate(
             Observation::Duplicate { winner_ready_at } => {
                 item.metrics.duplicates.increment(1);
                 if let Some(winner_ready_at) = winner_ready_at {
-                    item.metrics.duplicate_lag.record(
-                        item.ready_for_channel_at
-                            .saturating_duration_since(winner_ready_at)
-                            .as_secs_f64(),
-                    );
+                    let lag = item
+                        .ready_for_channel_at
+                        .saturating_duration_since(winner_ready_at);
+                    item.metrics.duplicate_lag.record(lag.as_secs_f64());
+                    if let (Some(rotation), Some(watch)) =
+                        (rotation.as_mut(), watches.get_mut(item.ordinal))
+                    {
+                        let now = Instant::now();
+                        watch.record(now, lag, rotation.policy.window);
+                        let cooled = last_rotation.is_none_or(|at| {
+                            now.saturating_duration_since(at) >= ROTATION_GLOBAL_COOLDOWN
+                        });
+                        if let Some(median) = watch.slow_median(now, &rotation.policy)
+                            && cooled
+                            && let Some(Some(lane)) = rotation.lanes.get(item.ordinal)
+                            && let Some(new_ip) = rotation.pool.take()
+                        {
+                            match lane.try_send(new_ip) {
+                                Ok(()) => {
+                                    rotation.pool.rotations.increment(1);
+                                    last_rotation = Some(now);
+                                    watch.reset(now);
+                                    reth_tracing::tracing::info!(
+                                        target: "arb-reth",
+                                        lane = item.ordinal,
+                                        median_lag_ms = median,
+                                        new_ip = %new_ip,
+                                        "feed: rotating persistently slow lane onto a spare source address"
+                                    );
+                                }
+                                Err(_) => rotation.pool.give_back(new_ip),
+                            }
+                        }
+                    }
                 }
             }
             Observation::Stale => item.metrics.stale.increment(1),
@@ -341,10 +508,16 @@ pub(crate) async fn follow(
     source: FeedSource,
     ingress: mpsc::Sender<FeedIngress>,
     resume_sequence: Arc<AtomicU64>,
+    rotation: Option<(Arc<RotationPool>, mpsc::Receiver<IpAddr>)>,
 ) {
     use futures_util::StreamExt;
 
-    let metrics = Arc::new(FeedSourceMetrics::new(&source));
+    let mut source = source;
+    let (pool, mut rotate_rx) = match rotation {
+        Some((pool, rx)) => (Some(pool), Some(rx)),
+        None => (None, None),
+    };
+    let mut metrics = Arc::new(FeedSourceMetrics::new(&source));
     let mut consecutive_failures = 0u32;
     // Spread the initial handshake burst. Several public relays rate-limit simultaneous upgrades
     // even when they are willing to keep the same number of established sockets open.
@@ -369,6 +542,7 @@ pub(crate) async fn follow(
         metrics.connection_attempts.increment(1);
         let mut pushed = 0usize;
         let mut rate_limited = false;
+        let mut rotate_to: Option<IpAddr> = None;
         match connect_source(&source, request).await {
             Ok((mut websocket, _)) => {
                 metrics.connected.set(1.0);
@@ -383,7 +557,15 @@ pub(crate) async fn follow(
                     "feed: connected to sequencer feed"
                 );
 
-                while let Some(frame) = websocket.next().await {
+                loop {
+                    let frame = tokio::select! {
+                        frame = websocket.next() => frame,
+                        new_ip = next_rotation(&mut rotate_rx) => {
+                            rotate_to = Some(new_ip);
+                            break;
+                        }
+                    };
+                    let Some(frame) = frame else { break };
                     let frame_received_at = Instant::now();
                     let text = match frame {
                         Ok(Message::Text(text)) => text.as_str().to_owned(),
@@ -427,6 +609,7 @@ pub(crate) async fn follow(
                     for message in root.messages.into_iter().flatten() {
                         metrics.messages.increment(1);
                         let item = FeedIngress {
+                            ordinal: source.ordinal,
                             message,
                             frame_received_at,
                             ready_for_channel_at,
@@ -464,6 +647,26 @@ pub(crate) async fn follow(
                     "feed: connection failed"
                 );
             }
+        }
+
+        if let Some(new_ip) = rotate_to {
+            // Re-deal this lane's relay ticket: rebind to the spare address, return the old one to
+            // the pool, and reconnect at once (no failure backoff: nothing failed).
+            let old_ip = source.local_ip.replace(new_ip);
+            if let (Some(pool), Some(old_ip)) = (pool.as_ref(), old_ip) {
+                pool.give_back(old_ip);
+            }
+            metrics = Arc::new(FeedSourceMetrics::new(&source));
+            reth_tracing::tracing::info!(
+                target: "arb-reth",
+                endpoint = source.endpoint,
+                connection = source.connection,
+                old_ip = ?old_ip,
+                new_ip = %new_ip,
+                "feed: lane rebound to a spare source address; reconnecting"
+            );
+            consecutive_failures = 0;
+            continue;
         }
 
         consecutive_failures = if pushed == 0 {
@@ -713,6 +916,37 @@ mod tests {
         assert!(reconnect_delay(100, 0, true) <= MAX_RATE_LIMIT_DELAY);
     }
 
+    #[test]
+    fn rotation_waits_for_enough_recent_samples_and_resets_its_window() {
+        let started = Instant::now();
+        let policy = RotationPolicy {
+            lag: Duration::from_millis(30),
+            window: Duration::from_secs(60),
+            min_samples: 3,
+        };
+        let mut watch = LaneWatch::new(started);
+        let sample_at = started + policy.window;
+        watch.record(sample_at, Duration::from_millis(40), policy.window);
+        watch.record(sample_at, Duration::from_millis(50), policy.window);
+        assert_eq!(watch.slow_median(sample_at, &policy), None);
+        let ready_at = sample_at + ROTATION_CHECK_INTERVAL;
+        watch.record(ready_at, Duration::from_millis(45), policy.window);
+        assert_eq!(watch.slow_median(ready_at, &policy), Some(45));
+
+        watch.reset(ready_at);
+        for _ in 0..3 {
+            watch.record(ready_at, Duration::from_millis(40), policy.window);
+        }
+        assert_eq!(
+            watch.slow_median(ready_at + ROTATION_CHECK_INTERVAL, &policy),
+            None,
+            "a rotated lane must receive a full new observation window"
+        );
+        let expired_at = ready_at + policy.window + Duration::from_secs(1);
+        watch.record(expired_at, Duration::from_millis(40), policy.window);
+        assert_eq!(watch.slow_median(expired_at, &policy), None);
+    }
+
     #[tokio::test]
     async fn a_source_bound_socket_reaches_the_server() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -758,6 +992,7 @@ mod tests {
             output_tx,
             FeedLatencyTracker::new(),
             resume.clone(),
+            None,
         ));
 
         let started = Instant::now();
@@ -771,6 +1006,7 @@ mod tests {
                     frame_received_at: started,
                     ready_for_channel_at: Instant::now(),
                     metrics: metrics[source].clone(),
+                    ordinal: source,
                 })
                 .await
                 .unwrap();

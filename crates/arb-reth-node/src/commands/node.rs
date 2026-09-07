@@ -29,11 +29,11 @@ use std::{
 use crate::feed;
 use crate::launcher::ArbLauncher;
 use crate::metrics::FeedLatencyTracker;
+use crate::mev_tx_logs::MevTxLogIpc;
 use crate::{
     ARB_ONE_CHAIN_ID, ArbNode, L1ResumeLog, arb_chain_spec, arbos_init_from_chain_config_json,
     arbos_init_from_parsed,
 };
-use crate::mev_tx_logs::MevTxLogIpc;
 use alloy_primitives::Address;
 use alloy_provider::{Provider, ProviderBuilder};
 use arb_reth_l1::{DelayedInboxReader, SequencerInboxReader};
@@ -171,6 +171,25 @@ pub struct ArbNodeArgs {
     /// These declarations may be combined with explicit OS-selected `--feed-connections`.
     #[arg(long = "feed-source", value_name = "IP=COUNT", action = clap::ArgAction::Append)]
     feed_sources: Vec<feed::FeedSourceSpec>,
+
+    /// Spare local source addresses. A source-bound lane whose duplicate lag (behind the winning
+    /// lane) stays at or above `--feed-rotate-lag-ms` for a whole `--feed-rotate-window-secs` is
+    /// rebound to the next spare; its old address returns to the pool. The relay assigns replicas
+    /// per source IP, so each address is an independent lottery ticket.
+    #[arg(long = "feed-spare-ip", value_name = "IP", action = clap::ArgAction::Append)]
+    feed_spare_ips: Vec<std::net::IpAddr>,
+
+    /// Rolling median duplicate lag, in milliseconds, at or above which a lane is rotated.
+    #[arg(long = "feed-rotate-lag-ms", value_name = "MS", default_value_t = 30)]
+    feed_rotate_lag_ms: u64,
+
+    /// Seconds a lane must stay slow before it rotates; also its cooldown after a rotation.
+    #[arg(
+        long = "feed-rotate-window-secs",
+        value_name = "SECS",
+        default_value_t = 600
+    )]
+    feed_rotate_window_secs: u64,
 
     /// Skip the L1-derivation catch-up loop, making `--feed-url` the sole block source. Genesis is
     /// still bootstrapped from `--l1-rpc` (chain id, spec, initial L1 base fee). Use this to follow a
@@ -640,7 +659,9 @@ async fn launch(
     let feed_sources =
         feed::expand_feed_sources(&args.feed_urls, args.feed_connections, &args.feed_sources)?;
     if args.no_l1_derive && feed_sources.is_empty() {
-        return Err(eyre::eyre!("--no-l1-derive requires at least one --feed-url"));
+        return Err(eyre::eyre!(
+            "--no-l1-derive requires at least one --feed-url"
+        ));
     }
     let mev_tx_log_ipc = args
         .mev_tx_log_ipc
@@ -769,19 +790,56 @@ async fn launch(
             .unwrap_or(feed_genesis_block)
             .saturating_sub(feed_genesis_block)
             + 1;
-        let resume_sequence = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(feed_start_seq));
+        let resume_sequence =
+            std::sync::Arc::new(std::sync::atomic::AtomicU64::new(feed_start_seq));
         let (ingress_tx, ingress_rx) = feed::ingress_channel();
+        // Lane rotation: bound lanes get a command channel; the coordinator re-deals a lane's
+        // source address when it stays persistently behind the winner.
+        let mut lane_receivers: Vec<Option<tokio::sync::mpsc::Receiver<std::net::IpAddr>>> =
+            Vec::with_capacity(feed_sources.len());
+        let rotation = (!args.feed_spare_ips.is_empty()).then(|| {
+            let mut lanes = Vec::with_capacity(feed_sources.len());
+            for source in &feed_sources {
+                if source.is_bound() {
+                    let (tx, rx) = feed::rotation_channel();
+                    lanes.push(Some(tx));
+                    lane_receivers.push(Some(rx));
+                } else {
+                    lanes.push(None);
+                    lane_receivers.push(None);
+                }
+            }
+            feed::Rotation {
+                pool: feed::RotationPool::new(args.feed_spare_ips.clone()),
+                policy: feed::RotationPolicy {
+                    lag: std::time::Duration::from_millis(args.feed_rotate_lag_ms),
+                    window: std::time::Duration::from_secs(args.feed_rotate_window_secs),
+                    min_samples: 200,
+                },
+                lanes,
+            }
+        });
+        let rotation_pool = rotation.as_ref().map(|rotation| rotation.pool.clone());
         task_executor.spawn_task(feed::coordinate(
             ingress_rx,
             feed_tx.clone(),
             feed_latency,
             resume_sequence.clone(),
+            rotation,
         ));
-        for source in feed_sources {
+        for (index, source) in feed_sources.into_iter().enumerate() {
+            let lane = match (
+                rotation_pool.as_ref(),
+                lane_receivers.get_mut(index).and_then(Option::take),
+            ) {
+                (Some(pool), Some(rx)) => Some((pool.clone(), rx)),
+                _ => None,
+            };
             task_executor.spawn_task(feed::follow(
                 source,
                 ingress_tx.clone(),
                 resume_sequence.clone(),
+                lane,
             ));
         }
     }
@@ -972,6 +1030,7 @@ mod tests {
     use alloy_primitives::{B64, B256};
     use clap::{Parser, Subcommand};
     use reth_provider::test_utils::MockEthProvider;
+    use reth_prune_types::{PruneMode, PrunePurpose, PruneSegment};
 
     const ROBINHOOD_CHAIN_INFO: &[u8] =
         include_bytes!("../../tests/fixtures/robinhood-chain-info.json");
@@ -1008,14 +1067,20 @@ mod tests {
 
         let from_header = genesis_delayed_messages_read(&spec, init.genesis_block_number);
         assert_eq!(from_header, Some(1));
-        assert_eq!(resolve_genesis_delayed_cursor(None, from_header).unwrap(), 1);
+        assert_eq!(
+            resolve_genesis_delayed_cursor(None, from_header).unwrap(),
+            1
+        );
         assert_eq!(
             resolve_genesis_delayed_cursor(Some(0), from_header)
                 .expect_err("a conflicting cursor must not derive a different chain")
                 .to_string(),
             "--l1-start-delayed is 0, but the L2 genesis header requires 1"
         );
-        assert_eq!(resolve_genesis_delayed_cursor(Some(1), from_header).unwrap(), 1);
+        assert_eq!(
+            resolve_genesis_delayed_cursor(Some(1), from_header).unwrap(),
+            1
+        );
         assert_eq!(
             genesis_delayed_messages_read(&spec, init.genesis_block_number + 1),
             None,
@@ -1100,13 +1165,13 @@ mod tests {
 
         assert_eq!(
             command.ext.feed_urls,
-            [
-                "wss://relay-a.example/feed",
-                "wss://relay-b.example/feed"
-            ]
+            ["wss://relay-a.example/feed", "wss://relay-b.example/feed"]
         );
         assert_eq!(command.ext.feed_connections, Some(3));
         assert!(command.ext.feed_sources.is_empty());
+        assert!(command.ext.feed_spare_ips.is_empty());
+        assert_eq!(command.ext.feed_rotate_lag_ms, 30);
+        assert_eq!(command.ext.feed_rotate_window_secs, 600);
     }
 
     #[test]
@@ -1120,6 +1185,16 @@ mod tests {
             "192.0.2.10=3",
             "--feed-source",
             "192.0.2.11=2",
+            "--feed-spare-ip",
+            "192.0.2.12",
+            "--feed-spare-ip",
+            "192.0.2.13",
+            "--feed-rotate-lag-ms",
+            "45",
+            "--feed-rotate-window-secs",
+            "900",
+            "--mev-tx-log-ipc",
+            "/tmp/mev-tx-logs.sock",
         ])
         .unwrap()
         .command;
@@ -1131,6 +1206,27 @@ mod tests {
         );
         assert_eq!(command.ext.feed_sources[0].connections, 3);
         assert_eq!(command.ext.feed_sources[1].connections, 2);
+        assert_eq!(
+            command.ext.feed_spare_ips,
+            [
+                "192.0.2.12".parse::<std::net::IpAddr>().unwrap(),
+                "192.0.2.13".parse::<std::net::IpAddr>().unwrap(),
+            ]
+        );
+        assert_eq!(command.ext.feed_rotate_lag_ms, 45);
+        assert_eq!(command.ext.feed_rotate_window_secs, 900);
+        assert_eq!(
+            command.ext.mev_tx_log_ipc,
+            Some(PathBuf::from("/tmp/mev-tx-logs.sock"))
+        );
+        let sources = feed::expand_feed_sources(
+            &command.ext.feed_urls,
+            command.ext.feed_connections,
+            &command.ext.feed_sources,
+        )
+        .expect("parsed source counts must produce usable feed lanes");
+        assert_eq!(sources.len(), 5);
+        assert!(sources.iter().all(feed::FeedSource::is_bound));
     }
 
     #[test]
@@ -1178,6 +1274,68 @@ mod tests {
             Some(PathBuf::from("/tmp/chain-config.json"))
         );
         assert_eq!(command.ext.feed_urls, ["wss://feed.example"]);
+    }
+
+    /// The operator's explicit retention window must survive the native CLI migration instead
+    /// of falling back to the much shorter `--full` preset.
+    #[test]
+    fn native_pruning_resolves_explicit_robinhood_retention() {
+        let TestCommand::Node(command) = TestCli::try_parse_from([
+            "arb-reth",
+            "node",
+            "--prune.receipts.distance",
+            "6000000",
+            "--prune.account-history.distance",
+            "6000000",
+            "--prune.storage-history.distance",
+            "6000000",
+            "--prune.sender-recovery.full",
+            "--prune.block-interval",
+            "5",
+        ])
+        .expect("explicit history retention arguments should parse")
+        .command;
+        assert!(!command.pruning.full);
+
+        let (chain_spec, _, _) =
+            crate::orbit_chain_from_files(ROBINHOOD_CHAIN_INFO, ROBINHOOD_GENESIS)
+                .expect("build Robinhood chain spec");
+        let config = command
+            .pruning
+            .prune_config(&chain_spec)
+            .expect("explicit pruning arguments must enable pruning");
+        assert!(!config.is_default());
+        assert_eq!(config.block_interval, 5);
+        assert_eq!(config.segments.sender_recovery, Some(PruneMode::Full));
+        assert_eq!(config.segments.transaction_lookup, None);
+        assert_eq!(config.segments.bodies_history, None);
+
+        // Check the resolved pruning targets, not just the strings accepted by clap. A 6M-block
+        // window at a 57M tip must never resolve to the short default retention boundary.
+        for (segment, mode) in [
+            (PruneSegment::Receipts, config.segments.receipts),
+            (
+                PruneSegment::AccountHistory,
+                config.segments.account_history,
+            ),
+            (
+                PruneSegment::StorageHistory,
+                config.segments.storage_history,
+            ),
+        ] {
+            let mode = mode.expect("history pruning mode must be present");
+            assert_eq!(mode, PruneMode::Distance(6_000_000));
+            assert_eq!(
+                mode.prune_target_block_with_min(
+                    57_000_000,
+                    segment,
+                    PrunePurpose::User,
+                    Some(config.minimum_pruning_distance),
+                )
+                .expect("retention window must be a valid pruning mode"),
+                Some((51_000_000, mode))
+            );
+        }
     }
 
     #[test]

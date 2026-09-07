@@ -71,3 +71,30 @@ arb-reth node \
 
 The non-node tools keep their command structure: `snapshot`, `genesis`, `rewind`, and
 `dump-blocks`.
+
+## Robinhood MEV fork
+
+The server additions remain available with the native CLI: `--mev-tx-log-ipc`, counted
+`--feed-source IP=COUNT`, `--feed-spare-ip`, `--feed-rotate-lag-ms`, and
+`--feed-rotate-window-secs`. IPC version 2 retains the kind-3 EndBlock and kind-4 FeedTxs
+frames consumed by the colocated bot. These events are provisional; see the
+[IPC protocol](mev-tx-log-ipc.md) for their validity and reconnect requirements.
+
+To retain the operator's six-million-block receipts and state-history window, pass the
+explicit pruning arguments instead of the shorter `--full` preset:
+
+```sh
+arb-reth node ... \
+  --prune.receipts.distance 6000000 \
+  --prune.account-history.distance 6000000 \
+  --prune.storage-history.distance 6000000 \
+  --prune.sender-recovery.full \
+  --prune.block-interval 5
+```
+
+The launcher uses Reth's effective pruning configuration after CLI and `reth.toml` are
+merged. Verify the startup `history pruning enabled` log shows the intended distances.
+Increasing retention does not restore history already pruned from an existing database.
+
+Server startup scripts must also migrate the old engine options listed above; merging
+the source does not rewrite those scripts or change a running node.

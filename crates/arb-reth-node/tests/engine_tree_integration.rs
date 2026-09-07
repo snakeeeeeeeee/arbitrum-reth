@@ -2,7 +2,9 @@
 #![allow(missing_docs)]
 
 mod tests {
-    use arb_reth_engine::{ArbEngineDriver, ArbEngineTuning};
+    use arb_reth_engine::{
+        ArbEngineDriver, ArbEngineTuning, ArbTxExecutionKind, ArbTxLogBroadcaster,
+    };
     use arb_reth_evm::ArbEvmConfig;
 
     use std::sync::Arc;
@@ -96,11 +98,7 @@ mod tests {
         factory
     }
 
-    async fn drive_replay_native(
-        factory: TestFactory,
-        chain_id: u64,
-        tuning: ArbEngineTuning,
-    ) {
+    async fn drive_replay_native(factory: TestFactory, chain_id: u64, tuning: ArbEngineTuning) {
         const TARGET: u64 = 17;
         const FEED: &str = include_str!("../tests/fixtures/testnode_feed_seq0_17.ndjson");
         const BLOCKS: &str = include_str!("../tests/fixtures/testnode_blocks_0_17.json");
@@ -117,6 +115,8 @@ mod tests {
         };
         let provider = BlockchainProvider::new(factory.clone()).expect("BlockchainProvider::new");
         let canonical = provider.canonical_in_memory_state();
+        let tx_log_stream = ArbTxLogBroadcaster::new();
+        let mut tx_events = tx_log_stream.subscribe();
         let mut driver = ArbEngineDriver::<TestNodeTypes>::spawn(
             factory,
             provider,
@@ -128,7 +128,7 @@ mod tests {
             Runtime::test(),
             tuning,
             None,
-            None,
+            Some(tx_log_stream),
             reth_tokio_util::EventSender::default(),
         )
         .expect("spawn native payload driver");
@@ -164,6 +164,50 @@ mod tests {
                     .expect("expected state root"),
                 "block {number} state root"
             );
+
+            // Exercise the actual producer, not only the IPC encoder. The extra notifications
+            // must bracket every included transaction without changing canonical replay hashes.
+            let mut events = Vec::new();
+            loop {
+                match tx_events.try_recv() {
+                    Ok(event) => events.push(event),
+                    Err(tokio::sync::broadcast::error::TryRecvError::Empty) => break,
+                    Err(error) => panic!("block {number} lost transaction events: {error}"),
+                }
+            }
+            assert!(
+                events.len() >= 3,
+                "block {number} must include both markers"
+            );
+            assert!(events.iter().all(|event| event.block_number == number));
+            let manifest = &events[0];
+            assert_eq!(manifest.kind, ArbTxExecutionKind::FeedTxs);
+            assert_eq!(manifest.transaction_index, manifest.feed_txs.len() as u64);
+            assert!(manifest.transaction_hash.is_zero());
+            assert!(manifest.frontier_id.is_zero());
+            let end = events.last().unwrap();
+            assert_eq!(end.kind, ArbTxExecutionKind::EndBlock);
+            assert!(end.transaction_hash.is_zero());
+            assert!(end.frontier_id.is_zero());
+            let transactions = &events[1..events.len() - 1];
+            assert_eq!(end.transaction_index, transactions.len() as u64);
+            assert_eq!(transactions[0].kind, ArbTxExecutionKind::StartBlock);
+            assert_eq!(
+                transactions.iter().map(|event| event.gas_used).sum::<u64>(),
+                header.gas_used,
+                "streamed transactions must account for the entire canonical block"
+            );
+            for (index, event) in transactions.iter().enumerate() {
+                assert_eq!(event.transaction_index, index as u64);
+                assert!(!event.frontier_id.is_zero());
+                assert!(!event.transaction_hash.is_zero());
+                assert!(matches!(
+                    event.kind,
+                    ArbTxExecutionKind::StartBlock
+                        | ArbTxExecutionKind::User
+                        | ArbTxExecutionKind::ScheduledRetry
+                ));
+            }
         }
         assert_eq!(canonicalized, (1..=TARGET).collect::<Vec<_>>());
 

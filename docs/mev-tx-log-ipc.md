@@ -17,7 +17,8 @@ permissions. Do not expose it through a TCP proxy.
 
 Each event is emitted only after the transaction has completed and been accepted by the block
 builder. It includes reverted transactions, with `success = 0`; their log list will normally be
-empty.
+empty. The one exception is the kind-`4` feed-transaction manifest, which is published before the
+block's first transaction executes (see below).
 
 The event is **pre-canonical**. `blockNumber` identifies the block currently being built, but there
 is no block hash because the final hash depends on every transaction and the state root. If block
@@ -53,7 +54,7 @@ Version 2 uses this body. Its fixed prefix is 96 bytes.
 | Offset | Size | Field | Meaning |
 | --- | ---: | --- | --- |
 | 0 | 1 | `version` | Always `2`. |
-| 1 | 1 | `kind` | `0` start-block, `1` user transaction, `2` scheduled retry. |
+| 1 | 1 | `kind` | `0` start-block, `1` user transaction, `2` scheduled retry, `3` end-of-block marker (no logs, zero hash; published right after the last transaction of the block executes), `4` feed-transaction manifest (published before the block's first transaction executes; layout below). |
 | 2 | 1 | `success` | `1` for EVM success, `0` for revert or halt. |
 | 3 | 1 | `flags` | Reserved. Must be zero in version 2. |
 | 4 | 8 | `blockNumber` | Provisional L2 block number. |
@@ -76,6 +77,52 @@ bytes[dataLength] data
 `topicCount` is the log's EVM topic count and must be at most four. `dataLength` may be zero.
 The consumer must reject a frame whose fields run past `frameLength` or which leaves trailing bytes
 after the final log.
+
+### Kind 4: feed-transaction manifest
+
+Once the sequencer feed message for a block has been decoded, and before ArbOS's start-block
+transaction or any user transaction executes, the producer publishes one kind-`4` frame carrying
+the `to` address and full calldata of the sequenced user transactions proposed for the block, in
+feed order. A colocated consumer can inspect direct call targets and input before execution.
+This is not a complete list of contracts or pools that will be touched: internal calls can select
+targets from storage, and scheduled retries are not included. Absence of an address in this
+manifest does not prove that its state will remain unchanged.
+
+The frame reuses the 96-byte prefix with fixed values:
+
+| Field | Value |
+| --- | --- |
+| `kind` | `4` |
+| `success` | `0` |
+| `flags` | `0` |
+| `blockNumber` | The same provisional block number as the block's other frames. |
+| `transactionIndex` | `N`, the number of manifest entries that follow. |
+| `gasUsed` | `0` |
+| `transactionHash` | 32 zero bytes. |
+| `frontierId` | 32 zero bytes. |
+| `logCount` | `0` |
+
+The prefix is followed by exactly `N` entries, encoded consecutively:
+
+```text
+bytes[20] to
+u32       calldataLength
+bytes[calldataLength] calldata
+```
+
+`to` is the call target, or 20 zero bytes for a contract creation. `calldata` is the transaction's
+full input; `calldataLength` may be zero. The consumer must reject a frame whose entries run past
+`frameLength` or which leaves trailing bytes after the final entry.
+
+Only user transactions carried by the feed message are listed; the internal start-block transaction
+and retries scheduled mid-block are not. The manifest is the producer's execution plan, not the
+final block: a listed transaction that proves invalid under the state transition (for example,
+insufficient funds) is dropped by the builder without a kind-`1` frame, so `N` may exceed the number
+of kind-`1` frames later published for the block. A manifest entry's index is not its final execution
+index: skipped invalid transactions and inserted retries can shift subsequent indices. Like every
+other frame it is pre-canonical and is
+published only while a client is connected. Kinds `3` and `4` carry a zero hash; deduplicate them by
+`(blockNumber, kind)`.
 
 ## Consumer requirements
 
