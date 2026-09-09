@@ -172,6 +172,17 @@ pub struct ArbNodeArgs {
     #[arg(long = "feed-source", value_name = "IP=COUNT", action = clap::ArgAction::Append)]
     feed_sources: Vec<feed::FeedSourceSpec>,
 
+    /// Extra relay endpoints (e.g. a paid feed sold per connection). Each gets exactly
+    /// `--feed-extra-connections` OS-selected lanes and never inherits the `--feed-source`
+    /// replica set, so a 10-lane public lottery does not open 10 paid lanes. Raced with the
+    /// `--feed-url` lanes by sequence number; never rotated. Tokens in the URL stay out of logs.
+    #[arg(long = "feed-extra-url", value_name = "URL", action = clap::ArgAction::Append)]
+    feed_extra_urls: Vec<String>,
+
+    /// Connections opened to each `--feed-extra-url`.
+    #[arg(long = "feed-extra-connections", value_name = "COUNT", default_value_t = 1)]
+    feed_extra_connections: usize,
+
     /// Spare local source addresses. A source-bound lane whose duplicate lag (behind the winning
     /// lane) stays at or above `--feed-rotate-lag-ms` for a whole `--feed-rotate-window-secs` is
     /// rebound to the next spare; its old address returns to the pool. The relay assigns replicas
@@ -656,8 +667,13 @@ async fn launch(
     bootstrap: NodeBootstrap,
 ) -> eyre::Result<()> {
     let task_executor = builder.task_executor().clone();
-    let feed_sources =
-        feed::expand_feed_sources(&args.feed_urls, args.feed_connections, &args.feed_sources)?;
+    let feed_sources = feed::expand_feed_sources_with_extra(
+        &args.feed_urls,
+        args.feed_connections,
+        &args.feed_sources,
+        &args.feed_extra_urls,
+        args.feed_extra_connections,
+    )?;
     if args.no_l1_derive && feed_sources.is_empty() {
         return Err(eyre::eyre!(
             "--no-l1-derive requires at least one --feed-url"

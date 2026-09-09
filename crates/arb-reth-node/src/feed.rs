@@ -273,19 +273,7 @@ pub(crate) fn expand_feed_sources(
 
     let mut sources = Vec::with_capacity(total);
     for (endpoint, raw_url) in urls.iter().enumerate() {
-        let parsed = url::Url::parse(raw_url)
-            .map_err(|err| eyre!("invalid --feed-url for endpoint {endpoint}: {err}"))?;
-        ensure!(
-            matches!(parsed.scheme(), "ws" | "wss") && parsed.host_str().is_some(),
-            "--feed-url endpoint {endpoint} must be an absolute ws:// or wss:// URL"
-        );
-
-        // Avoid putting credentials, paths, or query strings in logs and metric labels.
-        let host = parsed.host_str().expect("host checked above");
-        let display_endpoint = match parsed.port() {
-            Some(port) => format!("{}://{host}:{port}", parsed.scheme()),
-            None => format!("{}://{host}", parsed.scheme()),
-        };
+        let display_endpoint = display_endpoint_of(raw_url, endpoint, "--feed-url")?;
         let mut connection = 0usize;
         for _ in 0..unbound_connections {
             sources.push(FeedSource {
@@ -312,6 +300,63 @@ pub(crate) fn expand_feed_sources(
             }
         }
     }
+    Ok(sources)
+}
+
+/// Validate one relay URL and derive its path-free display form: credentials, paths and query
+/// strings never reach logs or metric labels.
+fn display_endpoint_of(raw_url: &str, endpoint: usize, flag: &str) -> Result<String> {
+    let parsed = url::Url::parse(raw_url)
+        .map_err(|err| eyre!("invalid {flag} for endpoint {endpoint}: {err}"))?;
+    ensure!(
+        matches!(parsed.scheme(), "ws" | "wss") && parsed.host_str().is_some(),
+        "{flag} endpoint {endpoint} must be an absolute ws:// or wss:// URL"
+    );
+    let host = parsed.host_str().expect("host checked above");
+    Ok(match parsed.port() {
+        Some(port) => format!("{}://{host}:{port}", parsed.scheme()),
+        None => format!("{}://{host}", parsed.scheme()),
+    })
+}
+
+/// [`expand_feed_sources`] plus extra endpoints that get a fixed number of OS-selected lanes
+/// each. A paid relay sold per connection must not inherit the public lottery's replica set
+/// (every `--feed-source` IP times its count), so extra endpoints never bind source addresses
+/// and never rotate; they are raced by sequence number like any other lane.
+pub(crate) fn expand_feed_sources_with_extra(
+    urls: &[String],
+    unbound_connections_per_endpoint: Option<usize>,
+    source_specs: &[FeedSourceSpec],
+    extra_urls: &[String],
+    extra_connections: usize,
+) -> Result<Vec<FeedSource>> {
+    let mut sources = expand_feed_sources(urls, unbound_connections_per_endpoint, source_specs)?;
+    if extra_urls.is_empty() {
+        return Ok(sources);
+    }
+    ensure!(
+        extra_connections > 0,
+        "--feed-extra-connections must be at least 1 when --feed-extra-url is given"
+    );
+    for (offset, raw_url) in extra_urls.iter().enumerate() {
+        let endpoint = urls.len().saturating_add(offset);
+        let display_endpoint = display_endpoint_of(raw_url, endpoint, "--feed-extra-url")?;
+        for connection in 0..extra_connections {
+            sources.push(FeedSource {
+                ordinal: sources.len(),
+                endpoint,
+                connection,
+                url: raw_url.clone(),
+                display_endpoint: display_endpoint.clone(),
+                local_ip: None,
+            });
+        }
+    }
+    ensure!(
+        sources.len() <= MAX_FEED_SOURCES,
+        "at most {MAX_FEED_SOURCES} sequencer feed connections are supported; configured {}",
+        sources.len()
+    );
     Ok(sources)
 }
 
@@ -856,6 +901,57 @@ mod tests {
         assert_eq!(sources[0].local_ip, Some("192.0.2.10".parse().unwrap()));
         assert_eq!(sources[1].local_ip, Some("192.0.2.10".parse().unwrap()));
         assert_eq!(sources[2].local_ip, Some("192.0.2.11".parse().unwrap()));
+    }
+
+    #[test]
+    fn extra_endpoints_get_fixed_unbound_lanes_only() {
+        let sources = expand_feed_sources_with_extra(
+            &["wss://public.example/feed".into()],
+            None,
+            &["192.0.2.10=2".parse().unwrap(), "192.0.2.11=1".parse().unwrap()],
+            &["wss://paid.example/ws/ultra/secret-token".into()],
+            1,
+        )
+        .unwrap();
+
+        // 3 bound lanes to the public relay, exactly 1 unbound lane to the paid one.
+        assert_eq!(sources.len(), 4);
+        assert!(sources[..3].iter().all(|s| s.endpoint == 0 && s.is_bound()));
+        assert_eq!(sources[3].endpoint, 1);
+        assert_eq!(sources[3].connection, 0);
+        assert_eq!(sources[3].ordinal, 3);
+        assert!(!sources[3].is_bound());
+        assert_eq!(sources[3].display_endpoint, "wss://paid.example");
+        assert!(!format!("{:?}", sources[3]).contains("secret-token"));
+
+        // No extras: identical to the plain expansion.
+        let plain = expand_feed_sources_with_extra(
+            &["wss://public.example/feed".into()],
+            Some(2),
+            &[],
+            &[],
+            0,
+        )
+        .unwrap();
+        assert_eq!(plain.len(), 2);
+
+        // Zero connections for a declared extra, or a bad URL, is a configuration error.
+        assert!(expand_feed_sources_with_extra(
+            &["wss://public.example/feed".into()],
+            None,
+            &[],
+            &["wss://paid.example/ws".into()],
+            0,
+        )
+        .is_err());
+        assert!(expand_feed_sources_with_extra(
+            &["wss://public.example/feed".into()],
+            None,
+            &[],
+            &["https://paid.example/ws".into()],
+            1,
+        )
+        .is_err());
     }
 
     #[test]
