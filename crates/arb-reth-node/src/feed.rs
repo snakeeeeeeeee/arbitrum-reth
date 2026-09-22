@@ -477,6 +477,10 @@ pub(crate) struct FeedTap {
     pub(crate) broadcaster: arb_reth_engine::ArbTxLogBroadcaster,
     /// L2 block of message index 0: a sequence number maps to block `sequence + genesis_block`.
     pub(crate) genesis_block: u64,
+    /// Chain id used to decode transactions for the early manifest.
+    pub(crate) chain_id: u64,
+    /// Publish the early kind-4 manifest (flags bit 0) for every first-seen sequence.
+    pub(crate) early_feed_txs: bool,
 }
 
 /// Forward the first decoded copy of every sequence to the engine channel.
@@ -506,18 +510,37 @@ pub(crate) async fn coordinate(
                 resume_sequence.store(race.next_resume, Ordering::Release);
                 feed_latency.record_frame_arrival(sequence, item.frame_received_at);
                 feed_latency.record_ready_for_channel(sequence, item.ready_for_channel_at);
-                if let Some(tap) = tap.as_ref() {
-                    tap.broadcaster.note_frame_arrival(
-                        sequence.saturating_add(tap.genesis_block),
-                        item.frame_received_at,
-                    );
+                let block_number = tap
+                    .as_ref()
+                    .map(|tap| sequence.saturating_add(tap.genesis_block));
+                if let (Some(tap), Some(block_number)) = (tap.as_ref(), block_number) {
+                    tap.broadcaster
+                        .note_frame_arrival(block_number, item.frame_received_at);
                 }
+                // Hand the message to the engine first (a cheap clone keeps it for decoding), then
+                // decode and publish the early manifest here. Decoding therefore never delays
+                // block production, and the manifest still leaves long before the engine's own
+                // (late) manifest, which waits for the payload-job round trip.
+                let early = tap.as_ref().filter(|tap| {
+                    tap.early_feed_txs && tap.broadcaster.has_subscribers()
+                });
+                let early_message = early.map(|_| item.message.clone());
                 if output.send(item.message).await.is_err() {
                     reth_tracing::tracing::warn!(
                         target: "arb-reth",
                         "feed channel closed; stopping sequencer feed coordinator"
                     );
                     return;
+                }
+                if let (Some(tap), Some(message), Some(block_number)) =
+                    (early, early_message.as_ref(), block_number)
+                {
+                    tap.broadcaster.publish_early_feed_txs(
+                        message,
+                        tap.chain_id,
+                        block_number,
+                        item.frame_received_at,
+                    );
                 }
             }
             Observation::Duplicate { winner_ready_at } => {

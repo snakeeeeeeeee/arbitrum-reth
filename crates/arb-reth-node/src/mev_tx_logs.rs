@@ -145,6 +145,9 @@ const FIXED_BODY_LEN: usize = 96;
 const MAX_LOG_TOPICS: usize = 4;
 /// Fixed bytes of one kind-4 manifest entry before its calldata: 20-byte `to` + u32 length.
 const FEED_TX_ENTRY_PREFIX_LEN: usize = 24;
+/// Flags bit 0 on a kind-4 frame: early manifest from the feed dedup coordinator (opt-in with
+/// `--mev-tx-log-early-feed-txs`). Every other frame keeps flags zero.
+const FLAG_EARLY_FEED_TXS: u8 = 0x01;
 
 fn encode_event(event: &ArbTxLogEvent) -> Result<Vec<u8>> {
     let log_count = u32::try_from(event.logs.len())
@@ -164,7 +167,7 @@ fn encode_event(event: &ArbTxLogEvent) -> Result<Vec<u8>> {
     // Kind 4 reuses the fixed prefix and appends `(to, calldata)` entries in place of logs. Keep
     // the frame unambiguous: a manifest never carries logs, no other kind carries entries, and the
     // entry count in the `transactionIndex` slot must match what follows.
-    let is_feed_txs = matches!(event.kind, ArbTxExecutionKind::FeedTxs);
+    let is_feed_txs = event.kind.is_feed_txs();
     if is_feed_txs && !event.logs.is_empty() {
         bail!("MEV feed-transactions event must not carry logs")
     }
@@ -192,10 +195,13 @@ fn encode_event(event: &ArbTxLogEvent) -> Result<Vec<u8>> {
         ArbTxExecutionKind::User => 1,
         ArbTxExecutionKind::ScheduledRetry => 2,
         ArbTxExecutionKind::EndBlock => 3,
-        ArbTxExecutionKind::FeedTxs => 4,
+        ArbTxExecutionKind::FeedTxs | ArbTxExecutionKind::FeedTxsEarly => 4,
     });
     encoded.push(u8::from(event.success));
-    encoded.push(0); // Reserved for future flags.
+    encoded.push(match event.kind {
+        ArbTxExecutionKind::FeedTxsEarly => FLAG_EARLY_FEED_TXS,
+        _ => 0,
+    });
     encoded.extend_from_slice(&event.block_number.to_be_bytes());
     encoded.extend_from_slice(&event.transaction_index.to_be_bytes());
     encoded.extend_from_slice(&event.gas_used.to_be_bytes());
@@ -338,6 +344,34 @@ mod tests {
         assert_eq!(&encoded[129..149], Address::ZERO.as_slice());
         assert_eq!(u32::from_be_bytes(encoded[149..153].try_into().unwrap()), 2);
         assert_eq!(&encoded[153..155], calldata_b.as_ref());
+    }
+
+    #[test]
+    fn early_manifest_is_kind_four_with_flag_bit_zero_and_same_body() {
+        let late = ArbTxLogEvent {
+            block_number: 42,
+            transaction_index: 1,
+            transaction_hash: B256::ZERO,
+            frontier_id: B256::ZERO,
+            kind: ArbTxExecutionKind::FeedTxs,
+            success: false,
+            gas_used: 0,
+            logs: Vec::new(),
+            feed_txs: vec![(Address::repeat_byte(0x11), Bytes::from_static(&[0xab]))],
+        };
+        let early = ArbTxLogEvent {
+            kind: ArbTxExecutionKind::FeedTxsEarly,
+            ..late.clone()
+        };
+        let late = encode_event(&late).expect("late manifest encodes");
+        let early = encode_event(&early).expect("early manifest encodes");
+        assert_eq!(late[5], 4);
+        assert_eq!(early[5], 4);
+        assert_eq!(late[7], 0);
+        assert_eq!(early[7], FLAG_EARLY_FEED_TXS);
+        // Everything but the flags byte is identical.
+        assert_eq!(late[..7], early[..7]);
+        assert_eq!(late[8..], early[8..]);
     }
 
     #[test]

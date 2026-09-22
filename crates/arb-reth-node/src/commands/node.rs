@@ -145,6 +145,13 @@ pub struct ArbNodeArgs {
     #[arg(long = "mev-tx-log-ipc", value_name = "PATH")]
     mev_tx_log_ipc: Option<PathBuf>,
 
+    /// Also publish each block's feed-transaction manifest (kind 4) from the feed dedup
+    /// coordinator the moment the first copy of the sequencer message arrives, marked with flags
+    /// bit 0, before the engine starts the block. The regular manifest (flags 0) still follows.
+    /// Consumers that reject nonzero flags must be updated before enabling this.
+    #[arg(long = "mev-tx-log-early-feed-txs", requires = "mev_tx_log_ipc")]
+    mev_tx_log_early_feed_txs: bool,
+
     /// Live sequencer-feed relay to follow, e.g. `ws://127.0.0.1:9642` (a nitro-testnode) or
     /// `wss://arb1.arbitrum.io/feed` (Arbitrum One). Repeat the option to race distinct relays. The
     /// first decoded copy of each sequence wins and later copies are discarded before execution.
@@ -841,6 +848,8 @@ async fn launch(
         let feed_tap = feed_tap_broadcaster.map(|broadcaster| feed::FeedTap {
             broadcaster,
             genesis_block: feed_genesis_block,
+            chain_id: effective_chain_id,
+            early_feed_txs: args.mev_tx_log_early_feed_txs,
         });
         task_executor.spawn_task(feed::coordinate(
             ingress_rx,

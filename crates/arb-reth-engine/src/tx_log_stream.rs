@@ -10,11 +10,14 @@ use std::{
     time::Instant,
 };
 
+use alloy_consensus::Transaction as _;
 use alloy_evm::EvmEnv;
-use alloy_primitives::{Address, B256, Bytes, Log, keccak256};
+use alloy_primitives::{Address, B256, Bytes, Log, TxKind, keccak256};
 use arb_reth_evm::ArbBlockEnv;
 use arb_revm::{ArbChainContext, ArbSpecId};
-use metrics::Histogram;
+use arbitrum_alloy_consensus::ArbTxEnvelope;
+use arbitrum_alloy_sequencer::sequencer::feed::BroadcastFeedMessage;
+use metrics::{Counter, Histogram};
 use revm::state::EvmState;
 use revm_database::CacheState;
 use tokio::sync::broadcast;
@@ -42,7 +45,41 @@ pub enum ArbTxExecutionKind {
     /// runs, so a colocated consumer learns what the block contains before execution finishes.
     /// Carries no hash, frontier, or logs; `transaction_index` holds the user-transaction count.
     FeedTxs,
+    /// The same manifest as [`Self::FeedTxs`], published by the feed dedup coordinator as soon as
+    /// the first copy of the sequencer message arrives, before the engine is asked to build the
+    /// block (and possibly while earlier blocks are still executing). Encoded as kind 4 with
+    /// flags bit 0 set. Opt-in (`--mev-tx-log-early-feed-txs`).
+    FeedTxsEarly,
 }
+
+impl ArbTxExecutionKind {
+    /// Whether this is a kind-4 feed-transaction manifest (late or early).
+    #[inline]
+    pub const fn is_feed_txs(self) -> bool {
+        matches!(self, Self::FeedTxs | Self::FeedTxsEarly)
+    }
+}
+
+/// `(to, calldata)` manifest entries of the given sequenced transactions, in order. `to` is
+/// [`Address::ZERO`] for a contract creation. Shared by the late and the early manifest so both
+/// carry exactly the same entries.
+pub fn feed_tx_manifest<'a>(
+    txs: impl IntoIterator<Item = &'a ArbTxEnvelope>,
+) -> Vec<(Address, Bytes)> {
+    txs.into_iter()
+        .map(|tx| {
+            let to = match tx.kind() {
+                TxKind::Call(to) => to,
+                TxKind::Create => Address::ZERO,
+            };
+            (to, tx.input().clone())
+        })
+        .collect()
+}
+
+/// Nitro `L1MessageType_BatchPostingReport`: the only message kind whose decoding depends on the
+/// ArbOS version, which the feed coordinator does not know. No early manifest for it.
+const L1_MESSAGE_BATCH_POSTING_REPORT: u8 = 13;
 
 /// Logs and final execution status for one successfully included transaction.
 ///
@@ -68,8 +105,8 @@ pub struct ArbTxLogEvent {
     /// EVM logs emitted by the transaction. Reverted and halted transactions normally have none.
     pub logs: Vec<Log>,
     /// `(to, calldata)` of every user transaction of the block, in execution order. Populated only
-    /// for [`ArbTxExecutionKind::FeedTxs`]; `to` is [`Address::ZERO`] for a contract creation.
-    /// Empty for every other kind.
+    /// for [`ArbTxExecutionKind::FeedTxs`] / [`ArbTxExecutionKind::FeedTxsEarly`]; `to` is
+    /// [`Address::ZERO`] for a contract creation. Empty for every other kind.
     pub feed_txs: Vec<(Address, Bytes)>,
 }
 
@@ -270,6 +307,13 @@ pub(crate) struct MevFrameMetrics {
     pub(crate) frame_to_feed_txs: Histogram,
     /// Feed frame arrival to the kind-3 block-tail publish.
     pub(crate) frame_to_tail: Histogram,
+    /// Feed frame arrival to the early kind-4 manifest publish (dedup coordinator).
+    pub(crate) early_frame: Histogram,
+    /// Early manifest decode time alone.
+    pub(crate) early_decode: Histogram,
+    /// Messages for which no early manifest was published although a consumer was connected
+    /// (batch-posting report or undecodable message; the late manifest still follows).
+    pub(crate) early_skipped: Counter,
 }
 
 pub(crate) fn mev_frame_metrics() -> &'static MevFrameMetrics {
@@ -280,6 +324,9 @@ pub(crate) fn mev_frame_metrics() -> &'static MevFrameMetrics {
         tail_frame: metrics::histogram!("arb_reth.mev.tail_frame_seconds"),
         frame_to_feed_txs: metrics::histogram!("arb_reth.mev.frame_to_feed_txs_seconds"),
         frame_to_tail: metrics::histogram!("arb_reth.mev.frame_to_tail_seconds"),
+        early_frame: metrics::histogram!("arb_reth.mev.early_frame_seconds"),
+        early_decode: metrics::histogram!("arb_reth.mev.early_decode_seconds"),
+        early_skipped: metrics::counter!("arb_reth.mev.early_skipped_total"),
     })
 }
 
@@ -363,6 +410,60 @@ impl ArbTxLogBroadcaster {
     #[inline]
     pub fn publish(&self, event: ArbTxLogEvent) {
         let _ = self.sender.send(event);
+    }
+
+    /// Decodes a freshly arrived sequencer message and publishes its early kind-4 manifest for
+    /// `block_number`, ahead of any engine work. `received_at` is the websocket frame arrival.
+    ///
+    /// Uses the same decoder as block production (`parse_message`), so the entries equal the late
+    /// manifest's. Returns `false` without publishing when no consumer is connected, for a
+    /// batch-posting report (its decoding depends on the ArbOS version, unknown here), and for a
+    /// message that does not decode (block production then yields an empty block or fails).
+    pub fn publish_early_feed_txs(
+        &self,
+        msg: &BroadcastFeedMessage,
+        chain_id: u64,
+        block_number: u64,
+        received_at: Instant,
+    ) -> bool {
+        if !self.has_subscribers() {
+            return false;
+        }
+        let metrics = mev_frame_metrics();
+        let l1_message = &msg.message_with_meta_data.l1_incoming_message;
+        if l1_message.header.kind == L1_MESSAGE_BATCH_POSTING_REPORT {
+            metrics.early_skipped.increment(1);
+            return false;
+        }
+        let decode_started_at = Instant::now();
+        // `version` only affects batch-posting reports, excluded above.
+        let Ok(txs) = arbitrum_alloy_sequencer::reader::parse_message(
+            l1_message.clone(),
+            chain_id,
+            0,
+        ) else {
+            metrics.early_skipped.increment(1);
+            return false;
+        };
+        let feed_txs = feed_tx_manifest(&txs);
+        metrics
+            .early_decode
+            .record(decode_started_at.elapsed().as_secs_f64());
+        self.publish(ArbTxLogEvent {
+            block_number,
+            transaction_index: feed_txs.len() as u64,
+            transaction_hash: B256::ZERO,
+            frontier_id: B256::ZERO,
+            kind: ArbTxExecutionKind::FeedTxsEarly,
+            success: false,
+            gas_used: 0,
+            logs: Vec::new(),
+            feed_txs,
+        });
+        metrics
+            .early_frame
+            .record(received_at.elapsed().as_secs_f64());
+        true
     }
 }
 

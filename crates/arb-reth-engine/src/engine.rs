@@ -14,10 +14,10 @@ use alloc::vec;
 use alloc::vec::Vec;
 
 use alloy_consensus::transaction::Recovered;
-use alloy_consensus::{Header, Transaction as _, constants::GWEI_TO_WEI};
+use alloy_consensus::{Header, constants::GWEI_TO_WEI};
 use alloy_eips::eip2718::Typed2718;
 use alloy_evm::EvmEnv;
-use alloy_primitives::{Address, B256, BlockNumber, Bytes, Log, StorageKey, StorageValue, TxKind};
+use alloy_primitives::{Address, B256, BlockNumber, Bytes, Log, StorageKey, StorageValue};
 use arb_reth_evm::ArbEvmConfig;
 use arb_reth_evm::config::ArbNextBlockEnvAttributes;
 use arb_revm::executor::{
@@ -79,7 +79,7 @@ use reth_trie::{
 use revm::context_interface::ContextTr as _;
 
 use crate::native_payload::ArbPayloadJobGenerator;
-use crate::tx_log_stream::mev_frame_metrics;
+use crate::tx_log_stream::{feed_tx_manifest, mev_frame_metrics};
 use crate::{
     ArbPayloadAttributes, ArbPayloadBuilder, ArbPayloadTypes, ArbPayloadValidator,
     ArbTxExecutionKind, ArbTxLogBroadcaster, ArbTxLogEvent,
@@ -185,6 +185,41 @@ pub(crate) fn produce_with_timing<'a>(
     let input =
         digest_message(feed_msg, arb_parent, cfg, version).wrap_err("digest_message failed")?;
 
+    // Pre-execution manifest for the MEV tx-log IPC: the `to` address and calldata of every user
+    // transaction this block will execute, in execution order. Published as soon as the message is
+    // digested, before state setup, pre-execution changes, sender recovery and the start-block
+    // transaction; none of those change the list. It bypasses frontier bookkeeping on purpose: it
+    // has no hash and no state. Only user txs from the feed message are listed; the internal
+    // start-block tx and any retries scheduled mid-block are not. A listed tx may still be dropped
+    // as invalid during execution. The feed coordinator may already have published the identical
+    // list as an early manifest (kind 4, flags bit 0).
+    let mut feed_txs_frame = Duration::ZERO;
+    if let Some(stream) = tx_log_stream
+        && stream.has_subscribers()
+    {
+        let feed_txs = feed_tx_manifest(&input.message.txs);
+        stream.publish(ArbTxLogEvent {
+            block_number: parent_header.number + 1,
+            transaction_index: feed_txs.len() as u64,
+            transaction_hash: B256::ZERO,
+            frontier_id: B256::ZERO,
+            kind: ArbTxExecutionKind::FeedTxs,
+            success: false,
+            gas_used: 0,
+            logs: Vec::new(),
+            feed_txs,
+        });
+        let published_at = Instant::now();
+        feed_txs_frame = published_at.saturating_duration_since(started_at);
+        let frame_metrics = mev_frame_metrics();
+        frame_metrics.feed_txs_frame.record(feed_txs_frame.as_secs_f64());
+        if let Some(arrived_at) = stream.frame_arrival(parent_header.number + 1) {
+            frame_metrics
+                .frame_to_feed_txs
+                .record(published_at.saturating_duration_since(arrived_at).as_secs_f64());
+        }
+    }
+
     let next_timestamp = input.message.l1_timestamp.max(arb_parent.timestamp);
     let finish_timing_out = Arc::new(std::sync::Mutex::new(Default::default()));
     let attrs = ArbNextBlockEnvAttributes {
@@ -273,46 +308,6 @@ pub(crate) fn produce_with_timing<'a>(
                 .collect()
         }
     };
-    // Pre-execution manifest for the MEV tx-log IPC: the `to` address and calldata of every user
-    // transaction this block will execute, in execution order, published before the start-block
-    // transaction runs. It bypasses frontier bookkeeping on purpose: it has no hash and no state.
-    // Only user txs from the feed message are listed; the internal start-block tx and any retries
-    // scheduled mid-block are not. A listed tx may still be dropped as invalid during execution.
-    let mut feed_txs_frame = Duration::ZERO;
-    if let Some(stream) = tx_log_stream
-        && stream.has_subscribers()
-    {
-        let feed_txs: Vec<(Address, Bytes)> = user_txs
-            .iter()
-            .map(|(tx, _)| {
-                let to = match tx.kind() {
-                    TxKind::Call(to) => to,
-                    TxKind::Create => Address::ZERO,
-                };
-                (to, tx.input().clone())
-            })
-            .collect();
-        stream.publish(ArbTxLogEvent {
-            block_number: parent_header.number + 1,
-            transaction_index: feed_txs.len() as u64,
-            transaction_hash: B256::ZERO,
-            frontier_id: B256::ZERO,
-            kind: ArbTxExecutionKind::FeedTxs,
-            success: false,
-            gas_used: 0,
-            logs: Vec::new(),
-            feed_txs,
-        });
-        let published_at = Instant::now();
-        feed_txs_frame = published_at.saturating_duration_since(started_at);
-        let frame_metrics = mev_frame_metrics();
-        frame_metrics.feed_txs_frame.record(feed_txs_frame.as_secs_f64());
-        if let Some(arrived_at) = stream.frame_arrival(parent_header.number + 1) {
-            frame_metrics
-                .frame_to_feed_txs
-                .record(published_at.saturating_duration_since(arrived_at).as_secs_f64());
-        }
-    }
     let mut redeems: VecDeque<ArbTxEnvelope> = VecDeque::new();
     // Set the block's L2 base fee. ArbOS stores `L2PricingState.BaseFeeWei` = the fee for the next
     // block (each block's start-block `update_pricing_model` computes and stores the successor's

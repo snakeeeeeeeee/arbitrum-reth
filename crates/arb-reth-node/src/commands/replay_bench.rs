@@ -25,7 +25,8 @@ use std::{
 };
 
 use crate::ArbNode;
-use arb_reth_engine::{ArbTxLogBroadcaster, reexecute_message};
+use alloy_primitives::{Address, Bytes};
+use arb_reth_engine::{ArbTxExecutionKind, ArbTxLogBroadcaster, reexecute_message};
 use arb_revm::{constants::ARBOS_STATE_ADDRESS, storage::read_serialized_chain_config};
 use arbitrum_alloy_sequencer::sequencer::feed::BroadcastFeedMessage;
 use clap::Parser;
@@ -83,6 +84,12 @@ pub struct ReplayBenchArgs {
     /// root, transactions root, logs bloom and gas used.
     #[arg(long)]
     verify_state_root: bool,
+
+    /// Also publish the early kind-4 manifest for every block (as the feed coordinator does with
+    /// `--mev-tx-log-early-feed-txs`), time its decode, and check that its entries equal the
+    /// engine's late manifest for the same block.
+    #[arg(long)]
+    early: bool,
 
     /// Per-block parent-state read cache in MiB (0 disables).
     #[arg(long, default_value_t = 64)]
@@ -211,14 +218,24 @@ pub fn run(args: ReplayBenchArgs) -> eyre::Result<()> {
     // (logs clone, manifest, block tail) is active exactly as in production.
     let broadcaster = (!args.no_stream).then(ArbTxLogBroadcaster::new);
     let drained = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    // Last manifest per (block, early) seen by the consumer.
+    type Manifests = Arc<Mutex<HashMap<(u64, bool), Vec<(Address, Bytes)>>>>;
+    let manifests: Manifests = Arc::default();
     if let Some(broadcaster) = broadcaster.as_ref() {
         let mut receiver = broadcaster.subscribe();
         let drained = Arc::clone(&drained);
+        let manifests = Arc::clone(&manifests);
         std::thread::spawn(move || {
             loop {
                 match receiver.blocking_recv() {
-                    Ok(_) => {
+                    Ok(event) => {
                         drained.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        if event.kind.is_feed_txs()
+                            && let Ok(mut manifests) = manifests.lock()
+                        {
+                            let early = matches!(event.kind, ArbTxExecutionKind::FeedTxsEarly);
+                            manifests.insert((event.block_number, early), event.feed_txs);
+                        }
                     }
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
                     Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
@@ -243,6 +260,9 @@ pub fn run(args: ReplayBenchArgs) -> eyre::Result<()> {
     let mut per_tx_mean_us = Vec::new();
     let mut tx_exec_us = Vec::new();
     let mut total_us = Vec::new();
+    let mut early_us = Vec::new();
+    let mut early_published = 0usize;
+    let mut early_mismatches = 0usize;
     for line in reader.lines() {
         let line = line?;
         let line = line.trim();
@@ -274,6 +294,15 @@ pub fn run(args: ReplayBenchArgs) -> eyre::Result<()> {
         let parent = SealedHeader::seal_slow(parent);
         let canonical = SealedHeader::seal_slow(canonical);
 
+        if args.early
+            && let Some(broadcaster) = broadcaster.as_ref()
+        {
+            let started = Instant::now();
+            if broadcaster.publish_early_feed_txs(&msg, args.chain_id, block, started) {
+                early_published += 1;
+                early_us.push(us(started.elapsed()));
+            }
+        }
         let cache = (args.cache_mb > 0)
             .then(|| arb_reth_engine::ArbReexecCache::new(args.cache_mb << 20));
         let mut last = None;
@@ -324,6 +353,27 @@ pub fn run(args: ReplayBenchArgs) -> eyre::Result<()> {
             .into_iter()
             .map(|seconds| seconds * 1e6)
             .collect();
+        if args.early && broadcaster.is_some() {
+            // Let the consumer thread catch up with this block's frames.
+            let deadline = Instant::now() + Duration::from_secs(2);
+            loop {
+                let done = manifests.lock().is_ok_and(|m| {
+                    m.contains_key(&(block, false)) && m.contains_key(&(block, true))
+                });
+                if done || Instant::now() > deadline {
+                    break;
+                }
+                std::thread::sleep(Duration::from_micros(200));
+            }
+            if let Ok(mut m) = manifests.lock() {
+                let late = m.remove(&(block, false));
+                let early = m.remove(&(block, true));
+                if early.is_some() && early != late {
+                    early_mismatches += 1;
+                    eprintln!("EARLY MANIFEST MISMATCH block {block}");
+                }
+            }
+        }
         let user_txs = result.transactions.saturating_sub(1).max(1);
         blocks += 1;
         tail_us.push(us(result.tail_frame));
@@ -373,6 +423,13 @@ pub fn run(args: ReplayBenchArgs) -> eyre::Result<()> {
     summarize("per_tx_mean_us (block)", per_tx_mean_us);
     summarize("tx_exec_us (tx)", tx_exec_us);
     summarize("total_us (block)", total_us);
+    if args.early {
+        println!("early manifests published={early_published} mismatches_vs_late={early_mismatches}");
+        summarize("early_publish_us (block)", early_us);
+    }
+    if early_mismatches != 0 {
+        eyre::bail!("{early_mismatches} early manifests differ from the late manifest");
+    }
     if mismatches != 0 {
         eyre::bail!("{mismatches} produced blocks differ from canonical");
     }
