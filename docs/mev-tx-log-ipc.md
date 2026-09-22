@@ -56,7 +56,7 @@ Version 2 uses this body. Its fixed prefix is 96 bytes.
 | 0 | 1 | `version` | Always `2`. |
 | 1 | 1 | `kind` | `0` start-block, `1` user transaction, `2` scheduled retry, `3` end-of-block marker (no logs, zero hash; published right after the last transaction of the block executes), `4` feed-transaction manifest (published before the block's first transaction executes; layout below). |
 | 2 | 1 | `success` | `1` for EVM success, `0` for revert or halt. |
-| 3 | 1 | `flags` | Reserved. Must be zero in version 2. |
+| 3 | 1 | `flags` | Zero, except bit 0 (`0x01`) on an early kind-`4` manifest (see below). All other bits are reserved and zero. |
 | 4 | 8 | `blockNumber` | Provisional L2 block number. |
 | 12 | 8 | `transactionIndex` | Index in the final block transaction order, including start-block. |
 | 20 | 8 | `gasUsed` | Final transaction gas used, including refunds. |
@@ -122,7 +122,51 @@ of kind-`1` frames later published for the block. A manifest entry's index is no
 index: skipped invalid transactions and inserted retries can shift subsequent indices. Like every
 other frame it is pre-canonical and is
 published only while a client is connected. Kinds `3` and `4` carry a zero hash; deduplicate them by
-`(blockNumber, kind)`.
+`(blockNumber, kind, flags)`.
+
+The regular (late) manifest is published as soon as the block's message has been digested by the
+payload builder, before state setup, pre-execution changes and sender recovery.
+
+### Early manifest (kind 4, flags bit 0)
+
+With `--mev-tx-log-early-feed-txs`, the feed dedup coordinator additionally publishes the manifest
+the moment the first websocket copy of a sequencer message arrives, before the message is handed
+to the engine's payload-job round trip. The frame is byte-for-byte the late manifest of the same
+block except `flags = 0x01`: it is produced by the same decoder (`parse_message`), so its entries
+are identical. Contract for consumers:
+
+- It is an announcement, not a block boundary. It can arrive while earlier blocks are still
+  executing (before their kind-`3` frame), so key it by `blockNumber`, never by "current block".
+- The late manifest (flags `0`) for the same block still follows, right before that block's
+  start-block frame. Deduplicate by `blockNumber`; either copy may be used.
+- It is best effort. There is no early manifest for a batch-posting-report message (its decoding
+  depends on the ArbOS version), for a message that does not decode, for messages that arrive
+  through L1 derivation or `--replay-feed` rather than the live feed, or while no client is
+  connected. A block whose message is later superseded (feed reorg/stall) may never execute.
+- Consumers that treat nonzero flags as a protocol error (as this document previously required)
+  must accept bit 0 on kind `4` before the option is enabled.
+
+## Frontier retention
+
+`--mev-tx-log-frontiers` (default `true`) controls whether execution retains post-transaction
+frontiers for `arb_simulateAtFrontier`. With `--mev-tx-log-frontiers=false` the node skips the
+per-transaction state-delta copy and the per-block pre-execution cache copy; frames carry an
+all-zero `frontierId` and the RPC reports every frontier as unavailable (`-32001`).
+
+## Latency metrics
+
+Recorded while `--mev-tx-log-ipc` is enabled (Prometheus names use `_` for `.`):
+
+| Metric | Meaning |
+| --- | --- |
+| `arb_reth.mev.early_frame_seconds` | Feed frame arrival to early manifest publish. |
+| `arb_reth.mev.early_decode_seconds` | Early manifest decode time. |
+| `arb_reth.mev.early_skipped_total` | Messages without an early manifest while a client was connected. |
+| `arb_reth.mev.frame_to_feed_txs_seconds` | Feed frame arrival to late manifest publish. |
+| `arb_reth.mev.feed_txs_frame_seconds` | Block production start to late manifest publish. |
+| `arb_reth.mev.tx_exec_seconds` | Per transaction: execution start to its frame published. |
+| `arb_reth.mev.frame_to_tail_seconds` | Feed frame arrival to the kind-`3` block-tail publish. |
+| `arb_reth.mev.tail_frame_seconds` | Block production start to the kind-`3` publish. |
 
 ## Consumer requirements
 
@@ -131,8 +175,8 @@ assume a socket read aligns with a frame. Set an application maximum before allo
 16 MiB is a reasonable initial ceiling for a local consumer, while the protocol's theoretical
 maximum is `u32::MAX` bytes.
 
-Unknown `version`, nonzero version-2 `flags`, an unknown `kind`, malformed lengths, or extra bytes
-must be treated as a protocol error. Close and reconnect rather than trying to resynchronize in the
+Unknown `version`, a set `flags` bit other than bit 0 on kind `4`, an unknown `kind`, malformed
+lengths, or extra bytes must be treated as a protocol error. Close and reconnect rather than trying to resynchronize in the
 middle of a stream.
 
 The protocol intentionally avoids JSON, hex encoding, and a schema runtime on the hot path. Its

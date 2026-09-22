@@ -28,7 +28,7 @@ pub(crate) struct MevTxLogIpc {
 
 impl MevTxLogIpc {
     /// Binds the requested local socket, replacing a stale socket from a previous shutdown.
-    pub(crate) fn bind(path: impl Into<PathBuf>) -> Result<Self> {
+    pub(crate) fn bind(path: impl Into<PathBuf>, frontiers: bool) -> Result<Self> {
         let path = path.into();
         remove_stale_socket(&path)?;
         let listener = UnixListener::bind(&path).wrap_err_with(|| {
@@ -37,7 +37,7 @@ impl MevTxLogIpc {
         Ok(Self {
             listener,
             path,
-            broadcaster: ArbTxLogBroadcaster::new(),
+            broadcaster: ArbTxLogBroadcaster::new().with_frontiers(frontiers),
         })
     }
 

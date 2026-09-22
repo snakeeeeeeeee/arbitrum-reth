@@ -152,6 +152,18 @@ pub struct ArbNodeArgs {
     #[arg(long = "mev-tx-log-early-feed-txs", requires = "mev_tx_log_ipc")]
     mev_tx_log_early_feed_txs: bool,
 
+    /// Retain post-transaction execution frontiers for `arb_simulateAtFrontier` (default true).
+    /// `false` skips the per-transaction state-delta copy and the per-block pre-execution cache
+    /// copy; frames then carry a zero `frontierId` and the RPC reports every frontier as expired.
+    #[arg(
+        long = "mev-tx-log-frontiers",
+        value_name = "BOOL",
+        default_value_t = true,
+        action = clap::ArgAction::Set,
+        requires = "mev_tx_log_ipc"
+    )]
+    mev_tx_log_frontiers: bool,
+
     /// Live sequencer-feed relay to follow, e.g. `ws://127.0.0.1:9642` (a nitro-testnode) or
     /// `wss://arb1.arbitrum.io/feed` (Arbitrum One). Repeat the option to race distinct relays. The
     /// first decoded copy of each sequence wins and later copies are discarded before execution.
@@ -689,7 +701,7 @@ async fn launch(
     let mev_tx_log_ipc = args
         .mev_tx_log_ipc
         .as_ref()
-        .map(|path| MevTxLogIpc::bind(path.clone()))
+        .map(|path| MevTxLogIpc::bind(path.clone(), args.mev_tx_log_frontiers))
         .transpose()?;
     // The feed coordinator shares the execution-side broadcaster (frame-arrival bookkeeping).
     let feed_tap_broadcaster = mev_tx_log_ipc.as_ref().map(MevTxLogIpc::broadcaster);

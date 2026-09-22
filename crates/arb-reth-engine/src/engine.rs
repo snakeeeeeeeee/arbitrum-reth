@@ -336,14 +336,19 @@ pub(crate) fn produce_with_timing<'a>(
     // Anchor exact MEV simulations after pre-execution changes. Each committed transaction adds
     // only its own state delta to a persistent chain; frontiers do not clone cumulative block
     // state and therefore remain cheap enough for the transaction-by-transaction feed.
-    let mut frontier_block = tx_log_stream.map(|stream| {
-        let evm_env = EvmEnv::new(
-            builder.evm().cfg_env().clone(),
-            builder.evm().block().clone(),
-        );
-        let pre_execution_state = builder.evm_mut().db_mut().cache.clone();
-        stream.begin_frontier_block(parent.hash(), evm_env, pre_execution_state)
-    });
+    // `--mev-tx-log-frontiers=false` skips all of it (the cache copy here and the per-transaction
+    // state-delta copy below); frames then carry a zero frontier id.
+    let mut frontier_block = tx_log_stream
+        .filter(|stream| stream.frontiers_enabled())
+        .map(|stream| {
+            let evm_env = EvmEnv::new(
+                builder.evm().cfg_env().clone(),
+                builder.evm().block().clone(),
+            );
+            let pre_execution_state = builder.evm_mut().db_mut().cache.clone();
+            stream.begin_frontier_block(parent.hash(), evm_env, pre_execution_state)
+        });
+    let capture_state_updates = frontier_block.is_some();
 
     let execution_setup = phase_started_at.elapsed();
     let phase_started_at = Instant::now();
@@ -393,7 +398,7 @@ pub(crate) fn produce_with_timing<'a>(
                     .filter(|log| is_redeem_scheduled_log(log))
                     .cloned(),
             );
-            if tx_log_stream.is_some() {
+            if capture_state_updates {
                 tx_state_update = Some(res.result.state.clone());
             }
             if has_log_subscribers {

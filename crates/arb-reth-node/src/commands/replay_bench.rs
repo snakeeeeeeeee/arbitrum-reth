@@ -80,6 +80,10 @@ pub struct ReplayBenchArgs {
     #[arg(long)]
     no_stream: bool,
 
+    /// Attach the stream with frontier retention off (`--mev-tx-log-frontiers=false`).
+    #[arg(long)]
+    no_frontiers: bool,
+
     /// Compute the state root and compare full block hashes (slow). Default compares receipts
     /// root, transactions root, logs bloom and gas used.
     #[arg(long)]
@@ -216,7 +220,8 @@ pub fn run(args: ReplayBenchArgs) -> eyre::Result<()> {
 
     // A connected consumer, like the bot: drain events on another thread so every publish path
     // (logs clone, manifest, block tail) is active exactly as in production.
-    let broadcaster = (!args.no_stream).then(ArbTxLogBroadcaster::new);
+    let broadcaster = (!args.no_stream)
+        .then(|| ArbTxLogBroadcaster::new().with_frontiers(!args.no_frontiers));
     let drained = Arc::new(std::sync::atomic::AtomicU64::new(0));
     // Last manifest per (block, early) seen by the consumer.
     type Manifests = Arc<Mutex<HashMap<(u64, bool), Vec<(Address, Bytes)>>>>;
@@ -411,8 +416,9 @@ pub fn run(args: ReplayBenchArgs) -> eyre::Result<()> {
     }
 
     println!(
-        "replay-bench: blocks={blocks} mismatches={mismatches} skipped={skipped} stream={} full_hash={} events_drained={}",
+        "replay-bench: blocks={blocks} mismatches={mismatches} skipped={skipped} stream={} frontiers={} full_hash={} events_drained={}",
         !args.no_stream,
+        !args.no_frontiers,
         args.verify_state_root,
         drained.load(std::sync::atomic::Ordering::Relaxed)
     );

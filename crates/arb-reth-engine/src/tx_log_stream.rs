@@ -338,6 +338,10 @@ pub(crate) fn mev_frame_metrics() -> &'static MevFrameMetrics {
 pub struct ArbTxLogBroadcaster {
     sender: broadcast::Sender<ArbTxLogEvent>,
     frontiers: ArbExecutionFrontierStore,
+    /// Whether execution retains post-transaction frontiers for `arb_simulateAtFrontier`. Off
+    /// skips the per-transaction state-delta copy, the per-block pre-execution cache copy and the
+    /// frontier bookkeeping; frames then carry a zero `frontierId`.
+    frontiers_enabled: bool,
     /// `(L2 block number, first feed-frame arrival)`, newest last. Metrics only.
     arrivals: Arc<Mutex<VecDeque<(u64, Instant)>>>,
 }
@@ -349,8 +353,21 @@ impl ArbTxLogBroadcaster {
         Self {
             sender,
             frontiers: ArbExecutionFrontierStore::default(),
+            frontiers_enabled: true,
             arrivals: Arc::new(Mutex::new(VecDeque::with_capacity(FRAME_ARRIVALS_CAPACITY))),
         }
+    }
+
+    /// Enables or disables execution-frontier retention (enabled by default).
+    pub fn with_frontiers(mut self, enabled: bool) -> Self {
+        self.frontiers_enabled = enabled;
+        self
+    }
+
+    /// Whether execution retains post-transaction frontiers.
+    #[inline]
+    pub const fn frontiers_enabled(&self) -> bool {
+        self.frontiers_enabled
     }
 
     /// Remembers when the first websocket copy of the message producing `block_number` arrived,
@@ -552,6 +569,7 @@ mod tests {
         let broadcaster = ArbTxLogBroadcaster {
             sender: broadcast::channel(1).0,
             frontiers: store.clone(),
+            frontiers_enabled: true,
             arrivals: Default::default(),
         };
         let mut block = broadcaster.begin_frontier_block(
