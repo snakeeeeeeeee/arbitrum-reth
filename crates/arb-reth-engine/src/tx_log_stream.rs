@@ -6,13 +6,15 @@
 
 use std::{
     collections::{HashMap, VecDeque},
-    sync::{Arc, RwLock},
+    sync::{Arc, Mutex, OnceLock, RwLock},
+    time::Instant,
 };
 
 use alloy_evm::EvmEnv;
 use alloy_primitives::{Address, B256, Bytes, Log, keccak256};
 use arb_reth_evm::ArbBlockEnv;
 use arb_revm::{ArbChainContext, ArbSpecId};
+use metrics::Histogram;
 use revm::state::EvmState;
 use revm_database::CacheState;
 use tokio::sync::broadcast;
@@ -249,6 +251,38 @@ impl ArbExecutionFrontierBlock {
     }
 }
 
+/// Number of feed-frame arrival instants retained for end-to-end frame latency metrics.
+const FRAME_ARRIVALS_CAPACITY: usize = 256;
+
+/// Latency histograms for the MEV transaction-log frames (all in seconds).
+///
+/// "Production start" is the start of `produce_with_timing` (after the payload job launched);
+/// "frame" is the arrival of the first websocket copy of the feed message carrying the block.
+pub(crate) struct MevFrameMetrics {
+    /// Per executed (non start-block) transaction: execution start to its log frame published,
+    /// including the per-transaction MEV bookkeeping (state delta capture, frontier, logs clone).
+    pub(crate) tx_exec: Histogram,
+    /// Production start to the late (pre-execution) kind-4 manifest publish.
+    pub(crate) feed_txs_frame: Histogram,
+    /// Production start to the kind-3 block-tail publish.
+    pub(crate) tail_frame: Histogram,
+    /// Feed frame arrival to the late kind-4 manifest publish.
+    pub(crate) frame_to_feed_txs: Histogram,
+    /// Feed frame arrival to the kind-3 block-tail publish.
+    pub(crate) frame_to_tail: Histogram,
+}
+
+pub(crate) fn mev_frame_metrics() -> &'static MevFrameMetrics {
+    static HANDLES: OnceLock<MevFrameMetrics> = OnceLock::new();
+    HANDLES.get_or_init(|| MevFrameMetrics {
+        tx_exec: metrics::histogram!("arb_reth.mev.tx_exec_seconds"),
+        feed_txs_frame: metrics::histogram!("arb_reth.mev.feed_txs_frame_seconds"),
+        tail_frame: metrics::histogram!("arb_reth.mev.tail_frame_seconds"),
+        frame_to_feed_txs: metrics::histogram!("arb_reth.mev.frame_to_feed_txs_seconds"),
+        frame_to_tail: metrics::histogram!("arb_reth.mev.frame_to_tail_seconds"),
+    })
+}
+
 /// Non-blocking publisher for per-transaction execution observations.
 ///
 /// A producer does no event cloning or serialization unless a local consumer is connected. Slow
@@ -257,6 +291,8 @@ impl ArbExecutionFrontierBlock {
 pub struct ArbTxLogBroadcaster {
     sender: broadcast::Sender<ArbTxLogEvent>,
     frontiers: ArbExecutionFrontierStore,
+    /// `(L2 block number, first feed-frame arrival)`, newest last. Metrics only.
+    arrivals: Arc<Mutex<VecDeque<(u64, Instant)>>>,
 }
 
 impl ArbTxLogBroadcaster {
@@ -266,7 +302,30 @@ impl ArbTxLogBroadcaster {
         Self {
             sender,
             frontiers: ArbExecutionFrontierStore::default(),
+            arrivals: Arc::new(Mutex::new(VecDeque::with_capacity(FRAME_ARRIVALS_CAPACITY))),
         }
+    }
+
+    /// Remembers when the first websocket copy of the message producing `block_number` arrived,
+    /// so the execution side can report frame-to-publish latency. Never blocks: a contended lock
+    /// just loses one sample.
+    pub fn note_frame_arrival(&self, block_number: u64, received_at: Instant) {
+        if let Ok(mut arrivals) = self.arrivals.try_lock() {
+            if arrivals.len() == FRAME_ARRIVALS_CAPACITY {
+                arrivals.pop_front();
+            }
+            arrivals.push_back((block_number, received_at));
+        }
+    }
+
+    /// Feed-frame arrival of the message producing `block_number`, if it was observed recently.
+    pub fn frame_arrival(&self, block_number: u64) -> Option<Instant> {
+        let arrivals = self.arrivals.try_lock().ok()?;
+        arrivals
+            .iter()
+            .rev()
+            .find(|(number, _)| *number == block_number)
+            .map(|(_, at)| *at)
     }
 
     /// Returns whether a local consumer is currently connected.
@@ -392,6 +451,7 @@ mod tests {
         let broadcaster = ArbTxLogBroadcaster {
             sender: broadcast::channel(1).0,
             frontiers: store.clone(),
+            arrivals: Default::default(),
         };
         let mut block = broadcaster.begin_frontier_block(
             B256::repeat_byte(0x11),

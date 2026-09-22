@@ -79,6 +79,7 @@ use reth_trie::{
 use revm::context_interface::ContextTr as _;
 
 use crate::native_payload::ArbPayloadJobGenerator;
+use crate::tx_log_stream::mev_frame_metrics;
 use crate::{
     ArbPayloadAttributes, ArbPayloadBuilder, ArbPayloadTypes, ArbPayloadValidator,
     ArbTxExecutionKind, ArbTxLogBroadcaster, ArbTxLogEvent,
@@ -155,6 +156,7 @@ pub(crate) fn produce_with_timing<'a>(
     trie_state_provider: Box<dyn StateProvider + 'a>,
     mut state_root_task: Option<PayloadStateRootHandle>,
     tx_log_stream: Option<&ArbTxLogBroadcaster>,
+    bench_skip_state_root: bool,
 ) -> eyre::Result<(
     BuiltPayloadExecutedBlock<ArbPrimitives>,
     ArbBlockProductionTiming,
@@ -276,6 +278,7 @@ pub(crate) fn produce_with_timing<'a>(
     // transaction runs. It bypasses frontier bookkeeping on purpose: it has no hash and no state.
     // Only user txs from the feed message are listed; the internal start-block tx and any retries
     // scheduled mid-block are not. A listed tx may still be dropped as invalid during execution.
+    let mut feed_txs_frame = Duration::ZERO;
     if let Some(stream) = tx_log_stream
         && stream.has_subscribers()
     {
@@ -300,6 +303,15 @@ pub(crate) fn produce_with_timing<'a>(
             logs: Vec::new(),
             feed_txs,
         });
+        let published_at = Instant::now();
+        feed_txs_frame = published_at.saturating_duration_since(started_at);
+        let frame_metrics = mev_frame_metrics();
+        frame_metrics.feed_txs_frame.record(feed_txs_frame.as_secs_f64());
+        if let Some(arrived_at) = stream.frame_arrival(parent_header.number + 1) {
+            frame_metrics
+                .frame_to_feed_txs
+                .record(published_at.saturating_duration_since(arrived_at).as_secs_f64());
+        }
     }
     let mut redeems: VecDeque<ArbTxEnvelope> = VecDeque::new();
     // Set the block's L2 base fee. ArbOS stores `L2PricingState.BaseFeeWei` = the fee for the next
@@ -446,6 +458,11 @@ pub(crate) fn produce_with_timing<'a>(
                 feed_txs: Vec::new(),
             });
         }
+        if tx_log_stream.is_some() && !is_internal {
+            mev_frame_metrics()
+                .tx_exec
+                .record(tx_started_at.elapsed().as_secs_f64());
+        }
         transaction_index += 1;
         let mut retry_scheduling = Duration::ZERO;
         if tx_success && !tx_logs.is_empty() {
@@ -467,6 +484,7 @@ pub(crate) fn produce_with_timing<'a>(
         }
     }
     // Block-end marker for the MEV tx-log IPC: every transaction of this block has executed.
+    let mut tail_frame = Duration::ZERO;
     if let Some(stream) = tx_log_stream
         && stream.has_subscribers()
     {
@@ -481,6 +499,15 @@ pub(crate) fn produce_with_timing<'a>(
             logs: Vec::new(),
             feed_txs: Vec::new(),
         });
+        let published_at = Instant::now();
+        tail_frame = published_at.saturating_duration_since(started_at);
+        let frame_metrics = mev_frame_metrics();
+        frame_metrics.tail_frame.record(tail_frame.as_secs_f64());
+        if let Some(arrived_at) = stream.frame_arrival(parent_header.number + 1) {
+            frame_metrics
+                .frame_to_tail
+                .record(published_at.saturating_duration_since(arrived_at).as_secs_f64());
+        }
     }
 
     let derived_transactions_unattributed = derived_transactions
@@ -548,6 +575,10 @@ pub(crate) fn produce_with_timing<'a>(
                     }
                 }
             }
+        } else if bench_skip_state_root {
+            // Offline benchmark only: a zero root instead of the (slow, historical) serial root.
+            // The produced block hash is then meaningless; callers compare the receipts root.
+            (Some((B256::ZERO, TrieUpdates::default())), None, false)
         } else {
             (None, None, false)
         };
@@ -617,8 +648,113 @@ pub(crate) fn produce_with_timing<'a>(
             state_root_task_succeeded,
             finish_assembly: finish_timing.block_assembly,
             finish_unattributed,
+            feed_txs_frame,
+            tail_frame,
         },
     ))
+}
+
+/// Result of re-executing one historical message with [`reexecute_message`].
+#[doc(hidden)]
+#[derive(Debug, Clone)]
+pub struct ArbReexecution {
+    /// Hash of the block this node produced from the message.
+    pub block_hash: B256,
+    /// Produced header state root.
+    pub state_root: B256,
+    /// Produced header receipts root.
+    pub receipts_root: B256,
+    /// Produced header transactions root.
+    pub transactions_root: B256,
+    /// Produced header logs bloom.
+    pub logs_bloom: alloy_primitives::Bloom,
+    /// Produced header gas used.
+    pub gas_used: u64,
+    /// Transactions in the produced block, including the start-block transaction.
+    pub transactions: usize,
+    /// Whole `produce_with_timing` call.
+    pub total: Duration,
+    /// Execution phase (setup, start-block transaction, derived transactions).
+    pub execution: Duration,
+    /// Derived (user + scheduled retry) transaction execution, summed.
+    pub derived_transactions: Duration,
+    /// Production start to the late kind-4 manifest publish.
+    pub feed_txs_frame: Duration,
+    /// Production start to the kind-3 block-tail publish.
+    pub tail_frame: Duration,
+    /// Finish phase (receipts, hashed state, state root, assembly).
+    pub finish: Duration,
+}
+
+/// Parent-state read cache for [`reexecute_message`], shared by repeated runs of one block so a
+/// warm run reads state like the live node's cross-block execution cache does.
+#[doc(hidden)]
+#[derive(Clone, Debug)]
+pub struct ArbReexecCache(reth_execution_cache::ExecutionCache);
+
+impl ArbReexecCache {
+    /// A fresh cache of roughly `bytes` capacity. Only valid for one parent block.
+    pub fn new(bytes: usize) -> Self {
+        Self(reth_execution_cache::ExecutionCache::new(bytes))
+    }
+}
+
+/// Executes one feed message on top of `parent` exactly like the payload builder does, but with
+/// caller-supplied state providers and no sparse state-root task (the root is computed serially
+/// by `finish`, or skipped with `skip_state_root`). Used by the offline `replay-bench` command to
+/// measure block production and to check produced blocks against canonical history. Not used by
+/// the live node.
+#[doc(hidden)]
+#[allow(clippy::too_many_arguments)]
+pub fn reexecute_message<'a>(
+    evm_config: &ArbEvmConfig,
+    chain_id: u64,
+    parent: &SealedHeader<Header>,
+    msg: &BroadcastFeedMessage,
+    exec_state_provider: Box<dyn StateProvider + 'a>,
+    trie_state_provider: Box<dyn StateProvider + 'a>,
+    tx_log_stream: Option<&ArbTxLogBroadcaster>,
+    parent_cache: Option<&ArbReexecCache>,
+    skip_state_root: bool,
+) -> eyre::Result<ArbReexecution> {
+    let exec_state_provider: Box<dyn StateProvider + 'a> = match parent_cache {
+        Some(cache) => Box::new(reth_execution_cache::CachedStateProvider::new_with_mode(
+            exec_state_provider,
+            cache.0.clone(),
+            reth_execution_cache::CacheFillMode::FillOnMiss,
+            None,
+            None,
+        )),
+        None => exec_state_provider,
+    };
+    let (executed, timing) = produce_with_timing(
+        evm_config,
+        chain_id,
+        parent,
+        msg,
+        exec_state_provider,
+        trie_state_provider,
+        None,
+        tx_log_stream,
+        skip_state_root,
+    )?;
+    let block = &executed.recovered_block;
+    let header = block.header();
+    Ok(ArbReexecution {
+        block_hash: block.hash(),
+        state_root: header.state_root,
+        receipts_root: header.receipts_root,
+        transactions_root: header.transactions_root,
+        logs_bloom: header.logs_bloom,
+        gas_used: header.gas_used,
+        transactions: block.body().transactions.len(),
+        total: timing.total,
+        execution: timing.execution,
+        derived_transactions: timing.derived_transactions,
+        feed_txs_frame: timing.feed_txs_frame,
+        tail_frame: timing.tail_frame,
+        finish: timing.finish,
+    })
 }
 
 struct EngineBlockMetricHandles {
@@ -929,6 +1065,10 @@ pub(crate) struct ArbBlockProductionTiming {
     pub(crate) state_root_task_succeeded: bool,
     pub(crate) finish_assembly: Duration,
     pub(crate) finish_unattributed: Duration,
+    /// Production start to the late kind-4 manifest publish (zero when nothing was published).
+    pub(crate) feed_txs_frame: Duration,
+    /// Production start to the kind-3 block-tail publish (zero when nothing was published).
+    pub(crate) tail_frame: Duration,
 }
 
 /// Driver-side timing around Reth's native payload-job lifecycle.

@@ -470,6 +470,15 @@ pub(crate) fn ingress_channel() -> (mpsc::Sender<FeedIngress>, mpsc::Receiver<Fe
     mpsc::channel(4096)
 }
 
+/// The MEV transaction-log stream as seen from the dedup coordinator.
+#[derive(Clone, Debug)]
+pub(crate) struct FeedTap {
+    /// The same broadcaster the payload builder publishes execution frames on.
+    pub(crate) broadcaster: arb_reth_engine::ArbTxLogBroadcaster,
+    /// L2 block of message index 0: a sequence number maps to block `sequence + genesis_block`.
+    pub(crate) genesis_block: u64,
+}
+
 /// Forward the first decoded copy of every sequence to the engine channel.
 pub(crate) async fn coordinate(
     mut ingress: mpsc::Receiver<FeedIngress>,
@@ -477,6 +486,7 @@ pub(crate) async fn coordinate(
     feed_latency: FeedLatencyTracker,
     resume_sequence: Arc<AtomicU64>,
     mut rotation: Option<Rotation>,
+    tap: Option<FeedTap>,
 ) {
     let mut race = SequenceRace::new(resume_sequence.load(Ordering::Acquire));
     let started = Instant::now();
@@ -496,6 +506,12 @@ pub(crate) async fn coordinate(
                 resume_sequence.store(race.next_resume, Ordering::Release);
                 feed_latency.record_frame_arrival(sequence, item.frame_received_at);
                 feed_latency.record_ready_for_channel(sequence, item.ready_for_channel_at);
+                if let Some(tap) = tap.as_ref() {
+                    tap.broadcaster.note_frame_arrival(
+                        sequence.saturating_add(tap.genesis_block),
+                        item.frame_received_at,
+                    );
+                }
                 if output.send(item.message).await.is_err() {
                     reth_tracing::tracing::warn!(
                         target: "arb-reth",
@@ -1088,6 +1104,7 @@ mod tests {
             output_tx,
             FeedLatencyTracker::new(),
             resume.clone(),
+            None,
             None,
         ));
 

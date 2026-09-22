@@ -11,6 +11,7 @@
 //! - `genesis verify-export`  verify a `reth-export --mode state` stream (stdin)
 //! - `rewind`           unwind the database to an earlier L2 block after a divergence
 //! - `dump-blocks`      dump block headers + tx hashes + receipt status
+//! - `replay-bench`     re-execute recorded feed messages read-only, time production, check hashes
 
 #![allow(missing_docs)]
 
@@ -19,6 +20,7 @@ use arb_reth_node::commands::{
     dump_blocks::DumpBlocksArgs,
     genesis::{GenesisVerifyArgs, GenesisVerifyExportArgs},
     node::{ArbChainSpecParser, ArbNodeArgs},
+    replay_bench::ReplayBenchArgs,
     rewind::RewindArgs,
     snapshot::{
         SnapshotBuildPreimagesArgs, SnapshotImportArgs, SnapshotReadArgs, SnapshotRepairHistoryArgs,
@@ -84,6 +86,8 @@ enum Command {
     Rewind(RewindArgs),
     /// Dump block headers + tx hashes + receipt status.
     DumpBlocks(DumpBlocksArgs),
+    /// Re-execute recorded feed messages (read-only), time production, check block hashes.
+    ReplayBench(ReplayBenchArgs),
 }
 
 #[derive(Debug, Args)]
@@ -200,7 +204,10 @@ fn main() -> eyre::Result<()> {
     }
 
     // Install the native recorder before any Arbitrum or Reth metric handle is initialized.
-    install_prometheus_recorder();
+    // `replay-bench` installs its own sample-capturing recorder instead.
+    if !matches!(cli.command, Command::ReplayBench(_)) {
+        install_prometheus_recorder();
+    }
 
     // rustls 0.23 carries both the aws-lc-rs and ring backends in our dep tree, so it can't pick a
     // process-default CryptoProvider on its own; the first wss:// feed connect (connect_async builds
@@ -226,6 +233,7 @@ fn main() -> eyre::Result<()> {
         },
         Command::Rewind(args) => commands::rewind::run(args),
         Command::DumpBlocks(args) => commands::dump_blocks::run(args),
+        Command::ReplayBench(args) => commands::replay_bench::run(args),
     }
 }
 

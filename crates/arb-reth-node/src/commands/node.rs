@@ -684,6 +684,8 @@ async fn launch(
         .as_ref()
         .map(|path| MevTxLogIpc::bind(path.clone()))
         .transpose()?;
+    // The feed coordinator shares the execution-side broadcaster (frame-arrival bookkeeping).
+    let feed_tap_broadcaster = mev_tx_log_ipc.as_ref().map(MevTxLogIpc::broadcaster);
     let NodeBootstrap {
         chain_id: effective_chain_id,
         rollup,
@@ -836,12 +838,17 @@ async fn launch(
             }
         });
         let rotation_pool = rotation.as_ref().map(|rotation| rotation.pool.clone());
+        let feed_tap = feed_tap_broadcaster.map(|broadcaster| feed::FeedTap {
+            broadcaster,
+            genesis_block: feed_genesis_block,
+        });
         task_executor.spawn_task(feed::coordinate(
             ingress_rx,
             feed_tx.clone(),
             feed_latency,
             resume_sequence.clone(),
             rotation,
+            feed_tap,
         ));
         for (index, source) in feed_sources.into_iter().enumerate() {
             let lane = match (

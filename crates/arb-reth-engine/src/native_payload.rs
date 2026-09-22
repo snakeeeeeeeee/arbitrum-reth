@@ -136,6 +136,7 @@ impl<P> ArbPayloadBuilder<P> {
             trie_state,
             args.state_root_handle,
             self.tx_log_stream.as_ref(),
+            false,
         )
         .map_err(|err| PayloadBuilderError::other(std::io::Error::other(err.to_string())))?;
         timing.parent_state = parent_state;

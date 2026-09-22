@@ -10,7 +10,7 @@ use serde::Deserialize;
 
 /// Extract `arbitrum.MaxCodeSize` from a Nitro serialized chain-config JSON blob. Returns 0 when
 /// absent (the caller treats 0 as "use the default"), mirroring Nitro's `MaxCodeSize()==0` sentinel.
-fn max_code_size_from_serialized_config(serialized_chain_config: &[u8]) -> u64 {
+pub(crate) fn max_code_size_from_serialized_config(serialized_chain_config: &[u8]) -> u64 {
     #[derive(Deserialize)]
     struct Wrapper {
         arbitrum: Option<ArbParams>,

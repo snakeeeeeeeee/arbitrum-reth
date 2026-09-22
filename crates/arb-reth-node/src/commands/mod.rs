@@ -5,6 +5,7 @@
 pub mod dump_blocks;
 pub mod genesis;
 pub mod node;
+pub mod replay_bench;
 pub mod rewind;
 pub mod snapshot;
 pub mod snapshot_full;
