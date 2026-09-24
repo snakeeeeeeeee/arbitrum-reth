@@ -31,7 +31,9 @@ use tokio::sync::oneshot;
 use metrics::{Counter, Histogram};
 
 use crate::{
-    ArbBuiltPayload, ArbPayloadAttributes, ArbTxLogBroadcaster, engine::produce_with_timing,
+    ArbBuiltPayload, ArbPayloadAttributes, ArbTxLogBroadcaster,
+    accel::{ArbBuildAccel, ArbPrewarmInput},
+    engine::{ArbMissStats, MissTimingStateProvider, produce_with_timing},
 };
 
 /// Stable worker name for the serial ArbOS payload builder.
@@ -44,6 +46,7 @@ pub struct ArbPayloadBuilder<P> {
     evm_config: ArbEvmConfig,
     chain_id: u64,
     tx_log_stream: Option<ArbTxLogBroadcaster>,
+    accel: ArbBuildAccel,
 }
 
 impl<P> ArbPayloadBuilder<P> {
@@ -54,6 +57,10 @@ impl<P> ArbPayloadBuilder<P> {
             evm_config,
             chain_id,
             tx_log_stream: None,
+            accel: ArbBuildAccel {
+                precompute: None,
+                prewarm: None,
+            },
         }
     }
 
@@ -69,7 +76,17 @@ impl<P> ArbPayloadBuilder<P> {
             evm_config,
             chain_id,
             tx_log_stream: Some(tx_log_stream),
+            accel: ArbBuildAccel {
+                precompute: None,
+                prewarm: None,
+            },
         }
+    }
+
+    /// Enables big-block acceleration (feed-arrival precompute, execution-cache prewarm).
+    pub fn with_accel(mut self, accel: ArbBuildAccel) -> Self {
+        self.accel = accel;
+        self
     }
 
     fn build(
@@ -77,7 +94,7 @@ impl<P> ArbPayloadBuilder<P> {
         args: BuildArguments<ArbPayloadAttributes, ArbBuiltPayload>,
     ) -> Result<ArbBuiltPayload, PayloadBuilderError>
     where
-        P: StateProviderFactory,
+        P: StateProviderFactory + Clone + Send + Sync + 'static,
     {
         let parent = args.config.parent_header;
         let parent_hash = parent.hash();
@@ -114,13 +131,25 @@ impl<P> ArbPayloadBuilder<P> {
             .map_err(PayloadBuilderError::other)?;
         let parent_state = started_at.elapsed();
 
+        // Reads that miss the shared cache are timed (two clock reads per miss) for the per-block
+        // miss metrics; the wrapper sits under the cache, so hits are untouched.
+        let miss_stats = Arc::new(ArbMissStats::default());
+        let mut prewarm_input = None;
         if let (Some(cache), Some(stats)) = (execution_cache, cache_stats.as_ref()) {
+            if self.accel.prewarm.is_some() {
+                let provider = self.provider.clone();
+                prewarm_input = Some(ArbPrewarmInput {
+                    source: Arc::new(move || provider.state_by_block_hash(parent_hash)),
+                    cache: cache.cache().clone(),
+                });
+            }
             execution_state = Box::new(CachedStateProvider::new_with_mode(
-                execution_state,
+                MissTimingStateProvider::new(execution_state, Arc::clone(&miss_stats)),
                 cache.cache().clone(),
-                // Unlike Ethereum's builder, this serial ArbOS path has no separate prewarmer.
-                // Populate misses so unchanged ArbOS slots and bytecode remain useful across
-                // blocks; the tree updates the same parent-bound cache after every insertion.
+                // The serial ArbOS path fills the cache itself (and, with prewarm, so do the
+                // workers). Populate misses so unchanged ArbOS slots and bytecode remain useful
+                // across blocks; the tree updates the same parent-bound cache after every
+                // insertion.
                 CacheFillMode::FillOnMiss,
                 None,
                 Some(Arc::clone(stats)),
@@ -137,10 +166,15 @@ impl<P> ArbPayloadBuilder<P> {
             args.state_root_handle,
             self.tx_log_stream.as_ref(),
             false,
+            &self.accel,
+            prewarm_input,
         )
         .map_err(|err| PayloadBuilderError::other(std::io::Error::other(err.to_string())))?;
         timing.parent_state = parent_state;
         timing.total = started_at.elapsed();
+        if cache_stats.is_some() {
+            record_miss_timing(&miss_stats);
+        }
 
         Ok(ArbBuiltPayload::from_executed(
             executed,
@@ -363,6 +397,36 @@ fn execution_cache_metric_handles() -> &'static ExecutionCacheMetricHandles {
         storage: CacheAccessMetricHandles::new("storage"),
         bytecode: CacheAccessMetricHandles::new("bytecode"),
     })
+}
+
+struct MissTimingMetricHandles {
+    read_seconds: Histogram,
+    read_max_seconds: Histogram,
+    slow_per_block: Histogram,
+    slow_total: Counter,
+}
+
+/// Per-block cost of the reads that missed the shared execution cache: their summed and slowest
+/// wall time, and how many took over 100 µs (page-cache misses / disk). Recorded after the block
+/// was built.
+fn record_miss_timing(stats: &ArbMissStats) {
+    use std::sync::atomic::Ordering;
+    static HANDLES: OnceLock<MissTimingMetricHandles> = OnceLock::new();
+    let handles = HANDLES.get_or_init(|| MissTimingMetricHandles {
+        read_seconds: metrics::histogram!("arb_reth.execution_cache_miss_read_seconds"),
+        read_max_seconds: metrics::histogram!("arb_reth.execution_cache_miss_read_max_seconds"),
+        slow_per_block: metrics::histogram!("arb_reth.execution_cache_miss_slow_per_block"),
+        slow_total: metrics::counter!("arb_reth.execution_cache_miss_slow_total"),
+    });
+    let slow = stats.slow.load(Ordering::Relaxed);
+    handles
+        .read_seconds
+        .record(stats.nanos.load(Ordering::Relaxed) as f64 / 1e9);
+    handles
+        .read_max_seconds
+        .record(stats.max_nanos.load(Ordering::Relaxed) as f64 / 1e9);
+    handles.slow_per_block.record(slow as f64);
+    handles.slow_total.increment(slow);
 }
 
 /// Flush one block's cache statistics after the measured production interval has ended.

@@ -21,7 +21,7 @@ use alloy_primitives::{Address, B256, BlockNumber, Bytes, Log, StorageKey, Stora
 use arb_reth_evm::ArbEvmConfig;
 use arb_reth_evm::config::ArbNextBlockEnvAttributes;
 use arb_revm::executor::{
-    ArbExecCfg, ArbParentHeader, digest_message, is_redeem_scheduled_log,
+    ArbExecCfg, ArbParentHeader, digest_message_with, is_redeem_scheduled_log,
     scheduled_retries_from_redeem_logs,
 };
 use arb_revm::{ArbSpecId, ArbosState};
@@ -78,6 +78,9 @@ use reth_trie::{
 };
 use revm::context_interface::ContextTr as _;
 
+use crate::accel::{
+    ArbBuildAccel, ArbPrewarmInput, ArbPrewarmStats, ArbTxPrecompute, PreTx, PrewarmRun,
+};
 use crate::native_payload::ArbPayloadJobGenerator;
 use crate::tx_log_stream::{feed_tx_manifest, mev_frame_metrics};
 use crate::{
@@ -157,6 +160,8 @@ pub(crate) fn produce_with_timing<'a>(
     mut state_root_task: Option<PayloadStateRootHandle>,
     tx_log_stream: Option<&ArbTxLogBroadcaster>,
     bench_skip_state_root: bool,
+    accel: &ArbBuildAccel,
+    prewarm_input: Option<ArbPrewarmInput>,
 ) -> eyre::Result<(
     BuiltPayloadExecutedBlock<ArbPrimitives>,
     ArbBlockProductionTiming,
@@ -182,8 +187,21 @@ pub(crate) fn produce_with_timing<'a>(
         chain_id,
         ..ArbExecCfg::default()
     };
-    let input =
-        digest_message(feed_msg, arb_parent, cfg, version).wrap_err("digest_message failed")?;
+    // #3: the feed coordinator may already have decoded this exact message and recovered senders,
+    // encoded the transactions and measured their brotli length on its pool. Only a result for an
+    // identical L1 message is taken; anything missing is computed here as before.
+    let precomputed = accel
+        .precompute
+        .as_ref()
+        .and_then(|precompute| precompute.take(feed_msg, chain_id));
+    let input = digest_message_with(
+        feed_msg,
+        arb_parent,
+        cfg,
+        version,
+        precomputed.as_ref().map(|block| block.txs.clone()),
+    )
+    .wrap_err("digest_message failed")?;
 
     // Pre-execution manifest for the MEV tx-log IPC: the `to` address and calldata of every user
     // transaction this block will execute, in execution order. Published as soon as the message is
@@ -236,6 +254,20 @@ pub(crate) fn produce_with_timing<'a>(
         finish_timing_out: Arc::clone(&finish_timing_out),
     };
 
+    // #4: prewarm workers execute this block's transactions on the parent state through the shared
+    // cache while this thread executes them for real. Joined before this function returns.
+    let mut prewarm_run = match (accel.prewarm.as_ref(), prewarm_input.as_ref()) {
+        (Some(prewarm), Some(prewarm_input)) => prewarm.start(
+            evm_config,
+            parent,
+            &attrs,
+            Arc::new(input.message.txs.clone()),
+            precomputed.clone(),
+            prewarm_input,
+        ),
+        _ => None,
+    };
+
     let phase_started_at = Instant::now();
 
     // `exec_state_provider` / `trie_state_provider` are independent instances. Sharing one would
@@ -285,17 +317,28 @@ pub(crate) fn produce_with_timing<'a>(
     // are carried per-tx so the loop reports the same first-in-order error it would have hit
     // serially. Retries scheduled mid-block and the internal start-block tx carry their sender in
     // the envelope and stay on the cheap inline path.
+    //
+    // With #3 the precompute pool fills per-transaction slots (sender, encoded bytes, brotli
+    // length) in execution order. They are not snapshotted here: each transaction looks up its
+    // slot when it is about to execute (later slots have had more time), and computes whatever is
+    // still missing inline. Without a precomputed result this is the previous up-front parallel
+    // recovery, unchanged.
+    let txs_len = input.message.txs.len();
+    let precomputed = precomputed.filter(|block| block.len() == txs_len);
+    let mut precompute_ready = 0usize;
     let mut user_txs: VecDeque<(
         ArbTxEnvelope,
-        Result<Address, alloy_primitives::SignatureError>,
+        Option<Result<Address, alloy_primitives::SignatureError>>,
     )> = {
         let txs: Vec<ArbTxEnvelope> = input.message.txs.into_iter().collect();
-        if txs.len() > 1 {
+        if precomputed.is_some() {
+            txs.into_iter().map(|tx| (tx, None)).collect()
+        } else if txs.len() > 1 {
             use rayon::iter::{IntoParallelIterator as _, ParallelIterator as _};
             txs.into_par_iter()
                 .map(|tx| {
                     let sender = tx.sender();
-                    (tx, sender)
+                    (tx, Some(sender))
                 })
                 .collect::<Vec<_>>()
                 .into()
@@ -303,7 +346,7 @@ pub(crate) fn produce_with_timing<'a>(
             txs.into_iter()
                 .map(|tx| {
                     let sender = tx.sender();
-                    (tx, sender)
+                    (tx, Some(sender))
                 })
                 .collect()
         }
@@ -360,15 +403,34 @@ pub(crate) fn produce_with_timing<'a>(
     let mut derived_transaction_execution = Duration::ZERO;
     let mut derived_retry_scheduling = Duration::ZERO;
     let mut transaction_index = 0;
+    let mut user_index = 0usize;
     loop {
-        let (tx, sender_result, kind) = if let Some(t) = first.take() {
+        let (tx, sender_result, kind, pre) = if let Some(t) = first.take() {
             let sender = t.sender();
-            (t, sender, ArbTxExecutionKind::StartBlock)
+            (t, sender, ArbTxExecutionKind::StartBlock, None)
         } else if let Some(t) = redeems.pop_front() {
             let sender = t.sender();
-            (t, sender, ArbTxExecutionKind::ScheduledRetry)
+            (t, sender, ArbTxExecutionKind::ScheduledRetry, None)
         } else if let Some((t, sender)) = user_txs.pop_front() {
-            (t, sender, ArbTxExecutionKind::User)
+            // Prewarm workers skip this transaction (the builder executes it now) and all
+            // earlier ones.
+            if let Some(run) = prewarm_run.as_ref() {
+                run.main_at(user_index + 1);
+            }
+            // #3: this transaction's precomputed slot, if the pool has filled it by now.
+            let pre: Option<PreTx> = precomputed
+                .as_ref()
+                .and_then(|block| block.ready(user_index).cloned());
+            if pre.is_some() {
+                precompute_ready += 1;
+            }
+            user_index += 1;
+            let sender = match (sender, pre.as_ref().and_then(|pre| pre.sender)) {
+                (Some(sender), _) => sender,
+                (None, Some(sender)) => Ok(sender),
+                (None, None) => t.sender(),
+            };
+            (t, sender, ArbTxExecutionKind::User, pre)
         } else {
             break;
         };
@@ -380,6 +442,10 @@ pub(crate) fn produce_with_timing<'a>(
         // reconnects. Full log cloning remains conditional on a connected stream consumer.
         let has_log_subscribers = tx_log_stream.is_some_and(ArbTxLogBroadcaster::has_subscribers);
         let tx_hash = tx_log_stream.map(|_| tx.hash());
+        // #3: reuse the precomputed canonical bytes and brotli length (same values the tx env
+        // conversion would compute; ArbOS ignores a length for another level or other bytes).
+        let tx_env =
+            pre.map(|pre| arb_reth_evm::ArbTx::from_precomputed(&tx, sender, pre.encoded, pre.l1));
         let recovered = Recovered::new_unchecked(tx, sender);
         let mut tx_logs: Vec<Log> = Vec::new();
         let mut tx_success = false;
@@ -387,24 +453,33 @@ pub(crate) fn produce_with_timing<'a>(
         let mut tx_gas_used = 0;
         let mut tx_state_update = None;
         let tx_started_at = Instant::now();
-        if let Err(e) = builder.execute_transaction_with_result_closure(recovered, |res| {
-            tx_success = res.result.result.is_success();
-            tx_gas_used = res.result.result.tx_gas_used();
-            tx_logs.extend(
-                res.result
-                    .result
-                    .logs()
-                    .iter()
-                    .filter(|log| is_redeem_scheduled_log(log))
-                    .cloned(),
-            );
-            if capture_state_updates {
-                tx_state_update = Some(res.result.state.clone());
-            }
-            if has_log_subscribers {
-                tx_event_logs = Some(res.result.result.logs().to_vec());
-            }
-        }) {
+        macro_rules! execute {
+            ($tx:expr) => {
+                builder.execute_transaction_with_result_closure($tx, |res| {
+                    tx_success = res.result.result.is_success();
+                    tx_gas_used = res.result.result.tx_gas_used();
+                    tx_logs.extend(
+                        res.result
+                            .result
+                            .logs()
+                            .iter()
+                            .filter(|log| is_redeem_scheduled_log(log))
+                            .cloned(),
+                    );
+                    if capture_state_updates {
+                        tx_state_update = Some(res.result.state.clone());
+                    }
+                    if has_log_subscribers {
+                        tx_event_logs = Some(res.result.result.logs().to_vec());
+                    }
+                })
+            };
+        }
+        let executed = match tx_env {
+            Some(tx_env) => execute!((tx_env, recovered)),
+            None => execute!(recovered),
+        };
+        if let Err(e) = executed {
             let tx_execution = tx_started_at.elapsed();
             if is_internal {
                 start_block_transaction += tx_execution;
@@ -509,6 +584,24 @@ pub(crate) fn produce_with_timing<'a>(
                 .record(published_at.saturating_duration_since(arrived_at).as_secs_f64());
         }
     }
+
+    if precomputed.is_some() {
+        ArbTxPrecompute::record_use(precompute_ready, user_index.saturating_sub(precompute_ready));
+    }
+    // Everything below is off the bot's critical path (the kind-3 frame has been published).
+    // #3: remember the level for the next precomputations. Read after the last transaction, so the
+    // journal read cannot interact with any transaction of this block.
+    if let Some(precompute) = accel.precompute.as_ref()
+        && let Ok(level) = ArbosState::open()
+            .brotli_compression_level
+            .get(builder.evm_mut().ctx_mut().journal_mut())
+    {
+        precompute.set_brotli_level(level as u32);
+    }
+    // #4: stop and join the prewarm workers. They must have released the shared execution cache
+    // before this block's changes are written into it (engine tree, after this returns).
+    let prewarm_stats = prewarm_run.as_mut().map(PrewarmRun::finish);
+    drop(prewarm_run);
 
     let derived_transactions_unattributed = derived_transactions
         .saturating_sub(derived_transaction_execution + derived_retry_scheduling);
@@ -650,6 +743,10 @@ pub(crate) fn produce_with_timing<'a>(
             finish_unattributed,
             feed_txs_frame,
             tail_frame,
+            precompute_hit: precomputed.is_some(),
+            precompute_ready,
+            precompute_txs: txs_len,
+            prewarm: prewarm_stats,
         },
     ))
 }
@@ -688,6 +785,14 @@ pub struct ArbReexecution {
     pub execution_setup: Duration,
     /// Research: the executed block's state changes, only when requested (live-like cache mode).
     pub bundle: Option<reth_revm::db::BundleState>,
+    /// #3: a precomputed result for this message was used.
+    pub precompute_hit: bool,
+    /// #3: user transactions whose precomputed slot was ready when the builder needed it.
+    pub precompute_ready: usize,
+    /// User transactions in the message.
+    pub precompute_txs: usize,
+    /// #4: prewarm outcome, when a prewarm ran.
+    pub prewarm: Option<ArbPrewarmStats>,
 }
 
 /// Parent-state read cache for [`reexecute_message`], shared by repeated runs of one block so a
@@ -718,10 +823,13 @@ impl ArbReexecCache {
     }
 }
 
-/// Research counters for reads that missed the execution cache and reached the state provider.
+/// Counters for reads that missed the execution cache and reached the state provider. Used by the
+/// live node for the per-block miss-timing metrics and by `replay-bench`.
 #[doc(hidden)]
 #[derive(Debug, Default)]
 pub struct ArbMissStats {
+    /// Also record missed storage keys (research re-timing; off on the live node).
+    pub capture_keys: bool,
     /// Account reads that reached the provider.
     pub accounts: AtomicU64,
     /// Storage reads that reached the provider.
@@ -741,6 +849,13 @@ pub struct ArbMissStats {
 impl ArbMissStats {
     const KEY_CAP: usize = 4096;
 
+    /// Total reads that reached the provider.
+    pub fn reads(&self) -> u64 {
+        self.accounts.load(Ordering::Relaxed)
+            + self.storage.load(Ordering::Relaxed)
+            + self.code.load(Ordering::Relaxed)
+    }
+
     fn add(&self, started_at: Instant) {
         let nanos = started_at.elapsed().as_nanos().min(u64::MAX as u128) as u64;
         self.nanos.fetch_add(nanos, Ordering::Relaxed);
@@ -751,12 +866,18 @@ impl ArbMissStats {
     }
 }
 
-/// Research: a state provider wrapper that counts and times every read reaching it. Placed
-/// *under* the execution cache, every call is a cache miss.
+/// A state provider wrapper that counts and times every read reaching it. Placed *under* the
+/// execution cache, every call is a cache miss. Two `Instant::now` calls per miss.
 #[derive(Debug)]
-struct MissTimingStateProvider<P> {
+pub(crate) struct MissTimingStateProvider<P> {
     inner: P,
     stats: Arc<ArbMissStats>,
+}
+
+impl<P> MissTimingStateProvider<P> {
+    pub(crate) const fn new(inner: P, stats: Arc<ArbMissStats>) -> Self {
+        Self { inner, stats }
+    }
 }
 
 impl<P: AccountReader> AccountReader for MissTimingStateProvider<P> {
@@ -789,7 +910,8 @@ impl<P: StateProvider> StateProvider for MissTimingStateProvider<P> {
         let result = self.inner.storage(account, storage_key);
         self.stats.add(started_at);
         self.stats.storage.fetch_add(1, Ordering::Relaxed);
-        if let Ok(mut keys) = self.stats.keys.try_lock()
+        if self.stats.capture_keys
+            && let Ok(mut keys) = self.stats.keys.try_lock()
             && keys.len() < ArbMissStats::KEY_CAP
         {
             keys.push((account, storage_key));
@@ -901,12 +1023,28 @@ impl<P: HashedPostStateProvider> HashedPostStateProvider for MissTimingStateProv
 
 /// Research options for [`reexecute_message_ext`].
 #[doc(hidden)]
-#[derive(Debug, Default)]
+#[derive(Default)]
 pub struct ArbReexecOptions {
     /// Count and time reads that miss the cache (wraps the provider under the cache).
     pub miss_stats: Option<Arc<ArbMissStats>>,
     /// Return the executed bundle state (to advance a cross-block cache).
     pub want_bundle: bool,
+    /// Big-block acceleration exactly as the live payload builder would use it. A precompute
+    /// result is only found if the caller submitted this message to `accel.precompute` first.
+    pub accel: ArbBuildAccel,
+    /// Opens parent-state providers for prewarm workers (prewarm also needs `parent_cache`).
+    pub prewarm_source: Option<crate::accel::ArbStateSource>,
+}
+
+impl core::fmt::Debug for ArbReexecOptions {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("ArbReexecOptions")
+            .field("miss_stats", &self.miss_stats)
+            .field("want_bundle", &self.want_bundle)
+            .field("accel", &self.accel)
+            .field("prewarm_source", &self.prewarm_source.is_some())
+            .finish()
+    }
 }
 
 /// Executes one feed message on top of `parent` exactly like the payload builder does, but with
@@ -973,6 +1111,13 @@ pub fn reexecute_message_ext<'a>(
         )),
         None => exec_state_provider,
     };
+    let prewarm_input = match (options.prewarm_source, parent_cache) {
+        (Some(source), Some(cache)) => Some(ArbPrewarmInput {
+            source,
+            cache: cache.0.clone(),
+        }),
+        _ => None,
+    };
     let (executed, timing) = produce_with_timing(
         evm_config,
         chain_id,
@@ -983,6 +1128,8 @@ pub fn reexecute_message_ext<'a>(
         None,
         tx_log_stream,
         skip_state_root,
+        &options.accel,
+        prewarm_input,
     )?;
     let block = &executed.recovered_block;
     let header = block.header();
@@ -1004,6 +1151,10 @@ pub fn reexecute_message_ext<'a>(
         bundle: options
             .want_bundle
             .then(|| executed.execution_output.state.clone()),
+        precompute_hit: timing.precompute_hit,
+        precompute_ready: timing.precompute_ready,
+        precompute_txs: timing.precompute_txs,
+        prewarm: timing.prewarm,
     })
 }
 
@@ -1319,6 +1470,14 @@ pub(crate) struct ArbBlockProductionTiming {
     pub(crate) feed_txs_frame: Duration,
     /// Production start to the kind-3 block-tail publish (zero when nothing was published).
     pub(crate) tail_frame: Duration,
+    /// #3: a precomputed result for this exact message was used.
+    pub(crate) precompute_hit: bool,
+    /// #3: user transactions whose precomputed slot was ready when needed.
+    pub(crate) precompute_ready: usize,
+    /// User transactions in the message.
+    pub(crate) precompute_txs: usize,
+    /// #4: prewarm outcome, when a prewarm ran.
+    pub(crate) prewarm: Option<ArbPrewarmStats>,
 }
 
 /// Driver-side timing around Reth's native payload-job lifecycle.
@@ -1625,6 +1784,7 @@ where
         prune_builder: Option<PrunerBuilder>,
         tx_log_stream: Option<ArbTxLogBroadcaster>,
         engine_events: reth_tokio_util::EventSender<ConsensusEngineEvent<ArbPrimitives>>,
+        accel: ArbBuildAccel,
     ) -> eyre::Result<Self> {
         // ---- persistence service (real MDBX writer; pruner from --prune.* flags) ----
         let (_finished_exex_height_tx, finished_exex_height_rx) =
@@ -1683,7 +1843,8 @@ where
                 stream,
             ),
             None => ArbPayloadBuilder::new(provider.clone(), evm_config.clone(), chain_id),
-        };
+        }
+        .with_accel(accel);
         let generator = ArbPayloadJobGenerator::new(provider.clone(), runtime.clone(), builder);
         let (service, payload_builder) = PayloadBuilderService::<_, _, ArbPayloadTypes>::new(
             generator,

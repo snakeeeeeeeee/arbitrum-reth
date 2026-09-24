@@ -78,8 +78,9 @@ pub use arb_reth_rpc::{ArbReceiptConverter, ArbRpcConverter};
 // The engine-tree driver, the payload-type stubs, and the minimal engine validator now live in the
 // `arb-reth-engine` crate; re-export for API stability.
 pub use arb_reth_engine::{
-    ArbBuiltPayload, ArbEngineDriver, ArbEngineTuning, ArbExecutionData, ArbPayloadAttributes,
-    ArbPayloadTypes, ArbPayloadValidator, ArbTxExecutionKind, ArbTxLogBroadcaster,
+    ArbBuildAccel, ArbBuiltPayload, ArbEngineDriver, ArbEngineTuning, ArbExecutionData,
+    ArbPayloadAttributes, ArbPayloadTypes, ArbPayloadValidator, ArbPrewarm, ArbTxExecutionKind,
+    ArbTxLogBroadcaster, ArbTxPrecompute, parse_cpu_list,
 };
 
 use alloy_consensus::Header;

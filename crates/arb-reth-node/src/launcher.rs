@@ -100,6 +100,8 @@ pub struct ArbLauncher {
     pub feed_latency: Option<FeedLatencyTracker>,
     /// Optional best-effort publisher for per-transaction execution logs.
     pub tx_log_stream: Option<ArbTxLogBroadcaster>,
+    /// Big-block acceleration for the payload builder (default: off).
+    pub build_accel: crate::ArbBuildAccel,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -238,6 +240,7 @@ impl ArbLauncher {
             l1_messages,
             feed_latency,
             tx_log_stream,
+            build_accel,
         } = self;
 
         let NodeBuilderWithComponents {
@@ -401,6 +404,7 @@ impl ArbLauncher {
             prune_builder,
             tx_log_stream,
             engine_events.clone(),
+            build_accel,
         )?;
 
         let (exit_tx, exit_rx) = oneshot::channel::<eyre::Result<()>>();
@@ -712,6 +716,7 @@ mod tests {
             l1_messages: l1_rx,
             feed_latency: None,
             tx_log_stream: None,
+            build_accel: Default::default(),
         };
 
         let handle = launcher
@@ -822,6 +827,7 @@ mod tests {
             l1_messages: l1_rx,
             feed_latency: None,
             tx_log_stream: None,
+            build_accel: Default::default(),
         };
         let handle = launcher
             .launch_node(node_builder_with_components)

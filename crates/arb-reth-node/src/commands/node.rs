@@ -164,6 +164,32 @@ pub struct ArbNodeArgs {
     )]
     mev_tx_log_frontiers: bool,
 
+    /// Precompute each first-seen feed message as soon as it arrives: decode it and, on a small
+    /// dedicated pool (`arb-precomp-N` threads), recover senders, encode transactions and measure
+    /// their brotli length for the L1 poster cost. The payload builder takes the result for the
+    /// identical message and skips that work; anything missing is computed as before.
+    #[arg(long = "precompute-feed-txs")]
+    precompute_feed_txs: bool,
+
+    /// Threads for `--precompute-feed-txs`.
+    #[arg(long = "precompute-threads", value_name = "N", default_value_t = 8)]
+    precompute_threads: usize,
+
+    /// Execution-cache prewarm: this many workers (`arb-prewarm-N` threads) execute each block's
+    /// transactions on the parent state while the builder executes them for real, so the builder's
+    /// reads hit the shared execution cache. 0 (default) disables it.
+    #[arg(long = "prewarm-threads", value_name = "N", default_value_t = 0)]
+    prewarm_threads: usize,
+
+    /// Only prewarm blocks with at least this many user transactions.
+    #[arg(long = "prewarm-min-txs", value_name = "N", default_value_t = 2)]
+    prewarm_min_txs: usize,
+
+    /// Pin the precompute and prewarm pool threads to these CPUs (e.g. `0-14,16-30`), keeping them
+    /// off the core reserved for the block builder. Default: inherit the process affinity.
+    #[arg(long = "accel-cpus", value_name = "LIST", value_parser = parse_accel_cpus)]
+    accel_cpus: Option<Vec<usize>>,
+
     /// Live sequencer-feed relay to follow, e.g. `ws://127.0.0.1:9642` (a nitro-testnode) or
     /// `wss://arb1.arbitrum.io/feed` (Arbitrum One). Repeat the option to race distinct relays. The
     /// first decoded copy of each sequence wins and later copies are discarded before execution.
@@ -298,6 +324,14 @@ pub struct ArbNodeArgs {
     /// Use with `--datadir <imported-dir>`; no separate Reth chain spec is needed.
     #[arg(long = "snapshot-head", value_name = "PATH")]
     snapshot_head: Option<PathBuf>,
+}
+
+fn parse_accel_cpus(raw: &str) -> Result<Vec<usize>, String> {
+    let cpus = crate::parse_cpu_list(raw)?;
+    if cpus.is_empty() {
+        return Err("empty cpu list".to_owned());
+    }
+    Ok(cpus)
 }
 
 /// The L1 rollup deployment arb-reth reads from: the contract addresses plus the L1 block the
@@ -705,6 +739,30 @@ async fn launch(
         .transpose()?;
     // The feed coordinator shares the execution-side broadcaster (frame-arrival bookkeeping).
     let feed_tap_broadcaster = mev_tx_log_ipc.as_ref().map(MevTxLogIpc::broadcaster);
+    // Big-block acceleration. Pools are created here, at startup, so a later `taskset -a -p`
+    // on the node process also covers their threads.
+    let accel_cpus = args.accel_cpus.clone().unwrap_or_default();
+    let build_accel = crate::ArbBuildAccel {
+        precompute: args.precompute_feed_txs.then(|| {
+            crate::ArbTxPrecompute::new(
+                bootstrap.chain_id,
+                args.precompute_threads,
+                accel_cpus.clone(),
+            )
+        }),
+        prewarm: (args.prewarm_threads > 0).then(|| {
+            crate::ArbPrewarm::new(args.prewarm_threads, args.prewarm_min_txs, accel_cpus.clone())
+        }),
+    };
+    info!(
+        target: "arb-reth",
+        precompute = build_accel.precompute.is_some(),
+        precompute_threads = args.precompute_threads,
+        prewarm_threads = args.prewarm_threads,
+        prewarm_min_txs = args.prewarm_min_txs,
+        accel_cpus = ?args.accel_cpus,
+        "big-block acceleration",
+    );
     let NodeBootstrap {
         chain_id: effective_chain_id,
         rollup,
@@ -746,6 +804,7 @@ async fn launch(
         l1_messages: l1_rx,
         feed_latency: feed_latency.clone(),
         tx_log_stream: mev_tx_log_ipc.as_ref().map(MevTxLogIpc::broadcaster),
+        build_accel: build_accel.clone(),
     };
 
     let handle = node_builder.launch_with(launcher).await?;
@@ -870,6 +929,7 @@ async fn launch(
             resume_sequence.clone(),
             rotation,
             feed_tap,
+            build_accel.precompute.clone(),
         ));
         for (index, source) in feed_sources.into_iter().enumerate() {
             let lane = match (

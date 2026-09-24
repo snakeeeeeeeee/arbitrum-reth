@@ -28,6 +28,8 @@ alloy-trie = { version = "0.9", default-features = false }
 eyre = "0.6.12"
 serde = { version = "1", default-features = false, features = ["derive"] }
 serde_json = { workspace = true }
+# replay-bench: build the global pool off the pinned main core.
+rayon = "1"
 
 # reth node types + storage surface
 reth-node-types = { git = "https://github.com/nuntax/reth.git", rev = "547581ff58e62577ef880e986a1b870feaa1a1b0" }
@@ -103,7 +105,7 @@ reth-cli-runner = { git = "https://github.com/nuntax/reth.git", rev = "547581ff5
 reth-tracing = { git = "https://github.com/nuntax/reth.git", rev = "547581ff58e62577ef880e986a1b870feaa1a1b0" }
 reth-node-core = { git = "https://github.com/nuntax/reth.git", rev = "547581ff58e62577ef880e986a1b870feaa1a1b0" }
 reth-node-metrics = { git = "https://github.com/nuntax/reth.git", rev = "547581ff58e62577ef880e986a1b870feaa1a1b0" }
-# Research (branch research/bigblock-0924): optional jemalloc global allocator, off by default.
+# Optional jemalloc global allocator (`jemalloc` feature), off by default.
 reth-cli-util = { git = "https://github.com/nuntax/reth.git", rev = "547581ff58e62577ef880e986a1b870feaa1a1b0", optional = true }
 reth-node-events = { git = "https://github.com/nuntax/reth.git", rev = "547581ff58e62577ef880e986a1b870feaa1a1b0" }
 reth-metrics = { git = "https://github.com/nuntax/reth.git", rev = "547581ff58e62577ef880e986a1b870feaa1a1b0" }
@@ -145,7 +147,7 @@ keccak-cache-global = [
     "reth-node-core/keccak-cache-global",
 ]
 gmp = ["reth-revm/gmp", "revm/gmp"]
-# Research: use jemalloc as the global allocator (reth's release binaries do). Off by default.
+# jemalloc as the global allocator (reth's release binaries do). Off by default; -2% execution.
 jemalloc = ["dep:reth-cli-util", "reth-cli-util/jemalloc"]
 
 [dev-dependencies]

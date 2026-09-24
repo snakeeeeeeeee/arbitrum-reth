@@ -55,6 +55,19 @@ inherits = "release"
 lto = "fat"
 codegen-units = 1
 
+# Big-block build (09-25): release (thin LTO) with a single codegen unit, plus Sapphire Rapids code
+# generation (production and the idle box are both r7iz, Xeon Gold 6455B; `target-cpu=native` there
+# is exactly `sapphirerapids`). A binary built this way must not run on an older CPU family. Build:
+#   RUSTFLAGS="-C target-cpu=sapphirerapids" cargo rustc --profile perf -p arb-reth-node \
+#     --bin arb-reth --features jemalloc -- -C link-arg=-Wl,--allow-multiple-definition
+# Output: target/perf/arb-reth. With one codegen unit the bin's no-op `__rust_probestack` shim and
+# wasmer_vm's own copy both reach the linker (the only duplicate symbol it reports); the link arg,
+# given to the final binary only, keeps the first definition (the shim, as in the regular build).
+# `maxperf`'s fat LTO still does not link.
+[profile.perf]
+inherits = "release"
+codegen-units = 1
+
 [profile.maxperf-symbols]
 inherits = "maxperf"
 debug = "full"
@@ -80,3 +93,13 @@ revm = { version = "42.0.1", features = [
 ] }
 alloy-rlp = "0.3.12"
 serde_json = "1.0.145"
+
+# 09-25 big-block speedups need three small, behavior-neutral additions to arb-revm: a precomputed
+# brotli-length hint for the L1 poster cost (`L1CompressedLen`), `digest_message_with` taking
+# already-decoded transactions, and a per-thread switch for the handler timing histograms. They
+# live in a local fork checked out next to this repository:
+#   ../arbitrum-revm   branch perf/bigblock-0925 = upstream 988d146 (the rev pinned above) + 944c09f
+# The pinned `rev` above stays the upstream base. To build elsewhere, copy that directory to the
+# same relative path, or push the fork and replace this path with its `git`/`rev`.
+[patch."https://github.com/nuntax/arbitrum-revm"]
+arb-revm = { path = "../arbitrum-revm/crates/arb-revm" }

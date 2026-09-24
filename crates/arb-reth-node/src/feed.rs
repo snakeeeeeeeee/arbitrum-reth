@@ -491,6 +491,7 @@ pub(crate) async fn coordinate(
     resume_sequence: Arc<AtomicU64>,
     mut rotation: Option<Rotation>,
     tap: Option<FeedTap>,
+    precompute: Option<arb_reth_engine::ArbTxPrecompute>,
 ) {
     let mut race = SequenceRace::new(resume_sequence.load(Ordering::Acquire));
     let started = Instant::now();
@@ -525,6 +526,13 @@ pub(crate) async fn coordinate(
                     tap.early_feed_txs && tap.broadcaster.has_subscribers()
                 });
                 let early_message = early.map(|_| item.message.clone());
+                // #3: queue an owned copy for the background precompute (decode, sender recovery,
+                // encoding, brotli length) that the payload builder picks up for this sequence.
+                // Queueing costs about a microsecond; the work runs on the precompute pool, so it
+                // also proceeds while the engine is still busy with earlier blocks.
+                if let Some(precompute) = precompute.as_ref() {
+                    precompute.submit(item.message.clone());
+                }
                 if output.send(item.message).await.is_err() {
                     reth_tracing::tracing::warn!(
                         target: "arb-reth",
@@ -1127,6 +1135,7 @@ mod tests {
             output_tx,
             FeedLatencyTracker::new(),
             resume.clone(),
+            None,
             None,
             None,
         ));

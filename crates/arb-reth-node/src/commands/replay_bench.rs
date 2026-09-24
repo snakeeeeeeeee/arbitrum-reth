@@ -149,6 +149,46 @@ pub struct ReplayBenchArgs {
     #[arg(long, default_value_t = 64)]
     cache_mb: usize,
 
+    /// #3: run the live node's feed-arrival precompute (`--precompute-feed-txs`) for every run:
+    /// the message is submitted to the precompute pool, then production starts after
+    /// `--precompute-lead-us` (the live frame-arrival -> production-start gap).
+    #[arg(long)]
+    precompute: bool,
+
+    /// Threads of the precompute pool.
+    #[arg(long, default_value_t = 8)]
+    precompute_threads: usize,
+
+    /// Microseconds between submitting a message to the precompute and starting its production
+    /// (live: frame arrival -> production start, ~690 µs median). Negative: wait until the
+    /// precompute has fully finished instead.
+    #[arg(long, default_value_t = 690, allow_hyphen_values = true)]
+    precompute_lead_us: i64,
+
+    /// #4: the live node's execution-cache prewarm (`--prewarm-threads`) with this many workers
+    /// (needs a cache; meaningful in `--live-cache-mb` mode). 0 disables.
+    #[arg(long, default_value_t = 0)]
+    prewarm: usize,
+
+    /// Only prewarm blocks with at least this many user transactions.
+    #[arg(long, default_value_t = 2)]
+    prewarm_min_txs: usize,
+
+    /// Pin the replay's executing (main) thread to this CPU, like the live builder thread on a
+    /// reserved core. Every other thread (rayon, precompute, prewarm, stream consumer) goes to
+    /// `--accel-cpus`.
+    #[arg(long)]
+    pin_main_cpu: Option<usize>,
+
+    /// CPUs for every non-main thread (e.g. `4-15,20-31`).
+    #[arg(long, value_name = "LIST")]
+    accel_cpus: Option<String>,
+
+    /// Record a digest of each block's executed state changes (`sd`); identical digests across
+    /// builds / switches prove identical post-state (hence state root) for that block.
+    #[arg(long)]
+    state_digest: bool,
+
     /// Write one JSON line per block here.
     #[arg(long, value_name = "PATH")]
     out: Option<PathBuf>,
@@ -184,7 +224,7 @@ impl Recorder for SampleRecorder {
         Gauge::noop()
     }
     fn register_histogram(&self, key: &Key, _: &Metadata<'_>) -> Histogram {
-        if key.name().starts_with("arb_reth.mev.") {
+        if key.name().starts_with("arb_reth.mev.") || key.name().starts_with("arb_reth.precompute.") {
             Histogram::from_arc(Arc::new(SampleSink {
                 name: key.name().to_string(),
                 samples: Arc::clone(&self.samples),
@@ -204,9 +244,10 @@ impl SampleRecorder {
             .unwrap_or_default()
     }
 
+    /// Drops the per-run MEV frame samples (precompute samples accumulate over the whole run).
     fn clear(&self) {
         if let Ok(mut samples) = self.samples.lock() {
-            samples.clear();
+            samples.retain(|name, _| !name.starts_with("arb_reth.mev."));
         }
     }
 }
@@ -342,10 +383,62 @@ fn synth_message_subset(
     })
 }
 
+/// keccak over a canonical encoding of a block's state changes (accounts sorted by address, each
+/// with its post info and sorted post storage values, destroyed flag, new bytecode hashes).
+fn bundle_digest(bundle: &reth_revm::db::BundleState) -> alloy_primitives::B256 {
+    let mut accounts: Vec<_> = bundle.state.iter().collect();
+    accounts.sort_by_key(|(address, _)| **address);
+    let mut buf = Vec::with_capacity(accounts.len() * 128);
+    for (address, account) in accounts {
+        buf.extend_from_slice(address.as_slice());
+        match account.info.as_ref() {
+            Some(info) => {
+                buf.push(1);
+                buf.extend_from_slice(&info.balance.to_be_bytes::<32>());
+                buf.extend_from_slice(&info.nonce.to_be_bytes());
+                buf.extend_from_slice(info.code_hash.as_slice());
+            }
+            None => buf.push(0),
+        }
+        buf.push(u8::from(account.was_destroyed()));
+        let mut slots: Vec<_> = account.storage.iter().collect();
+        slots.sort_by_key(|(key, _)| **key);
+        for (key, slot) in slots {
+            buf.extend_from_slice(&key.to_be_bytes::<32>());
+            buf.extend_from_slice(&slot.present_value.to_be_bytes::<32>());
+        }
+    }
+    let mut contracts: Vec<_> = bundle.contracts.keys().collect();
+    contracts.sort();
+    for hash in contracts {
+        buf.extend_from_slice(hash.as_slice());
+    }
+    alloy_primitives::keccak256(&buf)
+}
+
 pub fn run(args: ReplayBenchArgs) -> eyre::Result<()> {
     let recorder = SampleRecorder::default();
     metrics::set_global_recorder(recorder.clone())
         .map_err(|e| eyre::eyre!("install sample recorder: {e}"))?;
+
+    let accel_cpus = match args.accel_cpus.as_deref() {
+        Some(raw) => crate::parse_cpu_list(raw).map_err(|e| eyre::eyre!("--accel-cpus: {e}"))?,
+        None => Vec::new(),
+    };
+    if args.pin_main_cpu.is_some() {
+        // Create the global rayon pool (sender recovery) off the main core before pinning it.
+        let cpus = accel_cpus.clone();
+        let _ = rayon::ThreadPoolBuilder::new()
+            .start_handler(move |_| arb_reth_engine::pin_current_thread(&cpus))
+            .build_global();
+    }
+    let accel = arb_reth_engine::ArbBuildAccel {
+        precompute: args.precompute.then(|| {
+            crate::ArbTxPrecompute::new(args.chain_id, args.precompute_threads, accel_cpus.clone())
+        }),
+        prewarm: (args.prewarm > 0)
+            .then(|| crate::ArbPrewarm::new(args.prewarm, args.prewarm_min_txs, accel_cpus.clone())),
+    };
 
     let chain_spec: Arc<reth_chainspec::ChainSpec> = reth_chainspec::MAINNET.clone();
     let runtime = reth_tasks::Runtime::test();
@@ -381,7 +474,9 @@ pub fn run(args: ReplayBenchArgs) -> eyre::Result<()> {
         let mut receiver = broadcaster.subscribe();
         let drained = Arc::clone(&drained);
         let manifests = Arc::clone(&manifests);
+        let consumer_cpus = accel_cpus.clone();
         std::thread::spawn(move || {
+            arb_reth_engine::pin_current_thread(&consumer_cpus);
             loop {
                 match receiver.blocking_recv() {
                     Ok(event) => {
@@ -405,6 +500,12 @@ pub fn run(args: ReplayBenchArgs) -> eyre::Result<()> {
         .as_ref()
         .map(|path| fs::File::create(path).map(std::io::BufWriter::new))
         .transpose()?;
+    if let Some(cpu) = args.pin_main_cpu {
+        arb_reth_engine::pin_current_thread(&[cpu]);
+    }
+    let mut pre_hits = 0usize;
+    let mut pre_ready_txs = 0usize;
+    let mut pre_all_txs = 0usize;
 
     let live_cache = (args.live_cache_mb > 0).then(|| ArbReexecCache::new(args.live_cache_mb << 20));
     let repeat = if live_cache.is_some() { 1 } else { args.repeat.max(1) };
@@ -488,10 +589,34 @@ pub fn run(args: ReplayBenchArgs) -> eyre::Result<()> {
             recorder.clear();
             let exec: Box<dyn StateProvider> = factory.history_by_block_number(block - 1)?;
             let trie: Box<dyn StateProvider> = factory.history_by_block_number(block - 1)?;
-            let stats = live_cache.is_some().then(|| Arc::new(ArbMissStats::default()));
+            let stats = live_cache.is_some().then(|| {
+                Arc::new(ArbMissStats {
+                    capture_keys: args.retime_misses,
+                    ..Default::default()
+                })
+            });
             let prewarm = (args.prewarm_threads > 0 && live_cache.is_some())
                 .then_some(body.as_ref())
                 .flatten();
+            // #3: the message "arrives": submit it, then start production after the live gap.
+            if let Some(precompute) = accel.precompute.as_ref() {
+                let submitted_at = Instant::now();
+                precompute.submit(msg.clone());
+                if args.precompute_lead_us < 0 {
+                    precompute.wait_ready(msg.sequence_number, Duration::from_secs(5));
+                } else {
+                    let lead = Duration::from_micros(args.precompute_lead_us as u64);
+                    while submitted_at.elapsed() < lead {
+                        std::hint::spin_loop();
+                    }
+                }
+            }
+            let prewarm_source: Option<arb_reth_engine::ArbStateSource> =
+                accel.prewarm.as_ref().map(|_| {
+                    let factory = factory.clone();
+                    Arc::new(move || factory.history_by_block_number(block - 1))
+                        as arb_reth_engine::ArbStateSource
+                });
             let started = Instant::now();
             let result = std::thread::scope(|scope| {
                 let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -553,7 +678,9 @@ pub fn run(args: ReplayBenchArgs) -> eyre::Result<()> {
                     !args.verify_state_root,
                     ArbReexecOptions {
                         miss_stats: stats.clone(),
-                        want_bundle: live_cache.is_some(),
+                        want_bundle: live_cache.is_some() || args.state_digest,
+                        accel: accel.clone(),
+                        prewarm_source,
                     },
                 );
                 stop.store(true, std::sync::atomic::Ordering::Relaxed);
@@ -717,6 +844,11 @@ pub fn run(args: ReplayBenchArgs) -> eyre::Result<()> {
             None
         };
         let user_txs = result.transactions.saturating_sub(1).max(1);
+        if result.precompute_hit {
+            pre_hits += 1;
+        }
+        pre_ready_txs += result.precompute_ready;
+        pre_all_txs += result.precompute_txs;
         blocks += 1;
         tail_us.push(us(result.tail_frame));
         feed_txs_us.push(us(result.feed_txs_frame));
@@ -740,6 +872,22 @@ pub fn run(args: ReplayBenchArgs) -> eyre::Result<()> {
                 "finish_us": us(result.finish),
                 "tx_exec_us": tx_samples,
             });
+            if accel.precompute.is_some() {
+                line["pre_hit"] = serde_json::json!(result.precompute_hit);
+                line["pre_ready"] = serde_json::json!(result.precompute_ready);
+                line["pre_txs"] = serde_json::json!(result.precompute_txs);
+            }
+            if let Some(prewarm) = result.prewarm {
+                line["pw_exec"] = serde_json::json!(prewarm.executed);
+                line["pw_skip"] = serde_json::json!(prewarm.skipped);
+                line["pw_reads"] = serde_json::json!(prewarm.provider_reads);
+                line["pw_join_us"] = serde_json::json!(us(prewarm.join_wait));
+            }
+            if args.state_digest
+                && let Some(bundle) = result.bundle.as_ref()
+            {
+                line["sd"] = serde_json::json!(format!("{:x}", bundle_digest(bundle)));
+            }
             if let Some(counts) = miss_counts {
                 line["miss"] = serde_json::json!(counts);
                 line["miss_us"] = serde_json::json!(miss_us);
@@ -824,6 +972,20 @@ pub fn run(args: ReplayBenchArgs) -> eyre::Result<()> {
         args.live_cache_mb,
         drained.load(std::sync::atomic::Ordering::Relaxed)
     );
+    if accel.precompute.is_some() {
+        println!(
+            "precompute: hits={pre_hits}/{blocks} ready_txs={pre_ready_txs}/{pre_all_txs} lead_us={}",
+            args.precompute_lead_us
+        );
+        for name in ["parse", "ready", "lead"] {
+            let values: Vec<f64> = recorder
+                .take(&format!("arb_reth.precompute.{name}_seconds"))
+                .into_iter()
+                .map(|seconds| seconds * 1e6)
+                .collect();
+            summarize(&format!("precompute_{name}_us"), values);
+        }
+    }
     println!("(microseconds; per-block values are from the last of {repeat} runs)");
     summarize("tail_frame_us (block)", tail_us);
     summarize("feed_txs_frame_us (block)", feed_txs_us);

@@ -71,6 +71,7 @@ async fn rpc_serves_eth_queries() {
         l1_messages: l1_rx,
         feed_latency: None,
         tx_log_stream: Some(tx_log_stream),
+        build_accel: Default::default(),
     };
 
     let handle = launcher

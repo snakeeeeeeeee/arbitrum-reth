@@ -23,6 +23,7 @@ use reth_primitives_traits::{NodePrimitives, SealedBlock};
 
 use arbitrum_alloy_consensus::reth::ArbPrimitives;
 
+pub mod accel;
 pub mod engine;
 pub mod engine_spike;
 pub mod native_payload;
@@ -33,6 +34,10 @@ pub use engine::{
     ArbAppliedMessageTiming, ArbEngineDriver, ArbEngineTuning, ArbMissStats, ArbReexecCache,
     ArbReexecOptions, ArbReexecution, reexecute_message, reexecute_message_ext,
     wait_for_head,
+};
+pub use accel::{
+    ArbBuildAccel, ArbPrewarm, ArbPrewarmStats, ArbStateSource, ArbTxPrecompute, parse_cpu_list,
+    pin_current_thread,
 };
 pub use engine_spike::ArbPayloadValidator;
 pub use native_payload::ArbPayloadBuilder;

@@ -182,7 +182,25 @@ fn arb_tx_from_envelope(tx: &ArbTxEnvelope, caller: Address, encoded: Bytes) -> 
         retry_meta,
         tx_hash: Some(tx.hash()),
         encoded_2718: Some(encoded),
+        l1_compressed: None,
     })
+}
+
+impl ArbTx {
+    /// Builds the tx env from work done ahead of execution: the recovered `sender`, the canonical
+    /// EIP-2718 bytes `encoded` (must equal `tx.encoded_2718()`) and, optionally, the brotli
+    /// length of those bytes for the L1 poster cost. Identical to [`FromTxWithEncoded`] except for
+    /// the hint, which ArbOS only uses when its level and input length match.
+    pub fn from_precomputed(
+        tx: &ArbTxEnvelope,
+        sender: Address,
+        encoded: Bytes,
+        l1_compressed: Option<arb_revm::L1CompressedLen>,
+    ) -> Self {
+        let mut env = arb_tx_from_envelope(tx, sender, encoded);
+        env.0.l1_compressed = l1_compressed;
+        env
+    }
 }
 
 impl FromRecoveredTx<ArbTxEnvelope> for ArbTx {

@@ -15,7 +15,7 @@
 
 #![allow(missing_docs)]
 
-// Research (branch research/bigblock-0924): jemalloc global allocator behind the `jemalloc` feature.
+// jemalloc global allocator behind the `jemalloc` feature (off by default; measured -2% execution).
 #[cfg(feature = "jemalloc")]
 #[global_allocator]
 static ALLOC: reth_cli_util::allocator::Allocator = reth_cli_util::allocator::new_allocator();

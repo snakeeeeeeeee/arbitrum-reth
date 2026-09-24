@@ -3,7 +3,8 @@
 
 mod tests {
     use arb_reth_engine::{
-        ArbEngineDriver, ArbEngineTuning, ArbTxExecutionKind, ArbTxLogBroadcaster,
+        ArbBuildAccel, ArbEngineDriver, ArbEngineTuning, ArbPrewarm, ArbTxExecutionKind,
+        ArbTxLogBroadcaster, ArbTxPrecompute,
     };
     use arb_reth_evm::ArbEvmConfig;
 
@@ -75,6 +76,24 @@ mod tests {
         drive_replay_native(factory, 412346, tuning).await;
     }
 
+    /// Same gate with both big-block accelerations on: every message is precomputed (and waited
+    /// for, so the builder really uses it) and every block is prewarmed through the shared
+    /// execution cache. Block hashes and state roots must stay identical to Nitro's.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn engine_tree_tier1_replay_v2_hashed_sparse_accel() {
+        let factory = storage_v2_factory();
+        let tuning = ArbEngineTuning::from_tree_config(
+            ArbEngineTuning::reth_defaults()
+                .to_tree_config()
+                .with_share_sparse_trie_with_payload_builder(true),
+        );
+        let accel = ArbBuildAccel {
+            precompute: Some(ArbTxPrecompute::new(412346, 2, Vec::new())),
+            prewarm: Some(ArbPrewarm::new(2, 1, Vec::new())),
+        };
+        drive_replay_native_with(factory, 412346, tuning, accel).await;
+    }
+
     fn storage_v2_factory() -> TestFactory {
         // Emit a storage-v2 DB (hashed-state canonical, `PackedKeyAdapter`), mirroring the importer.
         use reth_db_api::models::StorageSettings;
@@ -99,6 +118,15 @@ mod tests {
     }
 
     async fn drive_replay_native(factory: TestFactory, chain_id: u64, tuning: ArbEngineTuning) {
+        drive_replay_native_with(factory, chain_id, tuning, ArbBuildAccel::default()).await;
+    }
+
+    async fn drive_replay_native_with(
+        factory: TestFactory,
+        chain_id: u64,
+        tuning: ArbEngineTuning,
+        accel: ArbBuildAccel,
+    ) {
         const TARGET: u64 = 17;
         const FEED: &str = include_str!("../tests/fixtures/testnode_feed_seq0_17.ndjson");
         const BLOCKS: &str = include_str!("../tests/fixtures/testnode_blocks_0_17.json");
@@ -130,6 +158,7 @@ mod tests {
             None,
             Some(tx_log_stream),
             reth_tokio_util::EventSender::default(),
+            accel.clone(),
         )
         .expect("spawn native payload driver");
 
@@ -143,6 +172,14 @@ mod tests {
         let mut canonicalized = Vec::with_capacity(message_count);
         for (index, message) in messages.into_iter().enumerate() {
             let number = message.sequence_number;
+            if let Some(precompute) = accel.precompute.as_ref() {
+                precompute.submit(message.clone());
+                // Batch-posting reports (kind 13) are never precomputed; other messages are, so
+                // the builder below really consumes the precomputed result.
+                if message.message_with_meta_data.l1_incoming_message.header.kind != 13 {
+                    let _ = precompute.wait_ready(number, std::time::Duration::from_secs(2));
+                }
+            }
             let defer_tail = index + 1 < message_count;
             let hash = driver
                 .advance_with_applied_overlap(&message, defer_tail, |sequence_number, _| {
