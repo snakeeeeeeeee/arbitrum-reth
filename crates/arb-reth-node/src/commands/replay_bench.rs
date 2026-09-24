@@ -93,6 +93,14 @@ pub struct ReplayBenchArgs {
     #[arg(long)]
     tx_detail: bool,
 
+    /// Research (live-like mode with `--synth-from-db` only): emulate a prewarm task. This many
+    /// threads each execute a strided slice of the block's user transactions on the parent state
+    /// through the shared cache (results discarded, cache filled on miss), concurrently with the
+    /// timed serial execution. They are stopped and joined before the block's changes advance the
+    /// cache, so no stale pre-state value can be inserted afterwards.
+    #[arg(long, default_value_t = 0)]
+    prewarm_threads: usize,
+
     /// Arbitrum chain id.
     #[arg(long, default_value_t = 4663)]
     chain_id: u64,
@@ -261,6 +269,18 @@ fn synth_message(
     number: u64,
     genesis_block: u64,
 ) -> Option<BroadcastFeedMessage> {
+    synth_message_subset(block, number, genesis_block, None)
+}
+
+/// Like [`synth_message`], but when `keep` is given only the user transactions whose position
+/// (0-based among the block's non-internal transactions) is listed are carried. Research only:
+/// used to emulate prewarm workers that execute a slice of the block on the parent state.
+fn synth_message_subset(
+    block: &arbitrum_alloy_consensus::reth::ArbBlock,
+    number: u64,
+    genesis_block: u64,
+    keep: Option<&[usize]>,
+) -> Option<BroadcastFeedMessage> {
     use alloy_consensus::Transaction as _;
     let txs = &block.body.transactions;
     let start = txs.first()?;
@@ -276,7 +296,13 @@ fn synth_message(
     let l1_base_fee = alloy_primitives::U256::from_be_slice(word(0));
     let l1_block_number = alloy_primitives::U256::from_be_slice(word(1)).saturating_to::<u64>();
     let mut l2 = vec![3u8];
-    for tx in &txs[1..] {
+    for (position, tx) in txs[1..].iter().enumerate() {
+        if keep.is_some_and(|keep| !keep.contains(&position)) {
+            if !matches!(tx.ty(), 0x00..=0x04 | 0x68) {
+                return None;
+            }
+            continue;
+        }
         match tx.ty() {
             0x00..=0x04 => {
                 let encoded = tx.encoded_2718();
@@ -463,22 +489,76 @@ pub fn run(args: ReplayBenchArgs) -> eyre::Result<()> {
             let exec: Box<dyn StateProvider> = factory.history_by_block_number(block - 1)?;
             let trie: Box<dyn StateProvider> = factory.history_by_block_number(block - 1)?;
             let stats = live_cache.is_some().then(|| Arc::new(ArbMissStats::default()));
+            let prewarm = (args.prewarm_threads > 0 && live_cache.is_some())
+                .then_some(body.as_ref())
+                .flatten();
             let started = Instant::now();
-            let result = reexecute_message_ext(
-                &evm_config,
-                args.chain_id,
-                &parent,
-                &msg,
-                exec,
-                trie,
-                broadcaster.as_ref(),
-                cache,
-                !args.verify_state_root,
-                ArbReexecOptions {
-                    miss_stats: stats.clone(),
-                    want_bundle: live_cache.is_some(),
-                },
-            )?;
+            let result = std::thread::scope(|scope| {
+                let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+                if let Some(body) = prewarm {
+                    let user = body.body.transactions.len().saturating_sub(1);
+                    let threads = args.prewarm_threads.min(user.max(1));
+                    for worker in 0..threads {
+                        // Each worker executes its strided slice one small chunk at a time, so it
+                        // can stop as soon as the serial execution has finished.
+                        let positions: Vec<usize> = (worker..user).step_by(threads).collect();
+                        let stop = Arc::clone(&stop);
+                        let factory = &factory;
+                        let evm_config = &evm_config;
+                        let parent = &parent;
+                        let live_cache = live_cache.as_ref();
+                        let chain_id = args.chain_id;
+                        let genesis_block = args.genesis_block;
+                        scope.spawn(move || {
+                            for chunk in positions.chunks(4) {
+                                if stop.load(std::sync::atomic::Ordering::Relaxed) {
+                                    break;
+                                }
+                                let Some(mini) =
+                                    synth_message_subset(body, block, genesis_block, Some(chunk))
+                                else {
+                                    break;
+                                };
+                                let (Ok(exec), Ok(trie)) = (
+                                    factory.history_by_block_number(block - 1),
+                                    factory.history_by_block_number(block - 1),
+                                ) else {
+                                    break;
+                                };
+                                let _ = reexecute_message_ext(
+                                    evm_config,
+                                    chain_id,
+                                    parent,
+                                    &mini,
+                                    exec,
+                                    trie,
+                                    None,
+                                    live_cache,
+                                    true,
+                                    ArbReexecOptions::default(),
+                                );
+                            }
+                        });
+                    }
+                }
+                let result = reexecute_message_ext(
+                    &evm_config,
+                    args.chain_id,
+                    &parent,
+                    &msg,
+                    exec,
+                    trie,
+                    broadcaster.as_ref(),
+                    cache,
+                    !args.verify_state_root,
+                    ArbReexecOptions {
+                        miss_stats: stats.clone(),
+                        want_bundle: live_cache.is_some(),
+                    },
+                );
+                stop.store(true, std::sync::atomic::Ordering::Relaxed);
+                result
+            })?;
             let wall = started.elapsed();
             let matches = if args.verify_state_root {
                 result.block_hash == canonical.hash()
