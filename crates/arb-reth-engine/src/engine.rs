@@ -684,6 +684,10 @@ pub struct ArbReexecution {
     pub tail_frame: Duration,
     /// Finish phase (receipts, hashed state, state root, assembly).
     pub finish: Duration,
+    /// Execution setup (builder, pre-execution changes, base fee, frontier base copy).
+    pub execution_setup: Duration,
+    /// Research: the executed block's state changes, only when requested (live-like cache mode).
+    pub bundle: Option<reth_revm::db::BundleState>,
 }
 
 /// Parent-state read cache for [`reexecute_message`], shared by repeated runs of one block so a
@@ -697,6 +701,212 @@ impl ArbReexecCache {
     pub fn new(bytes: usize) -> Self {
         Self(reth_execution_cache::ExecutionCache::new(bytes))
     }
+
+    /// Research (live-like replay): advance the cache past one executed block, exactly as the
+    /// engine tree does after inserting a block. Returns `false` (and clears) on inconsistency.
+    pub fn apply_block(&self, bundle: &reth_revm::db::BundleState) -> bool {
+        if self.0.insert_state(bundle).is_err() {
+            self.0.clear();
+            return false;
+        }
+        true
+    }
+
+    /// Research: drop every cached account and storage slot (bytecode stays valid).
+    pub fn clear(&self) {
+        self.0.clear();
+    }
+}
+
+/// Research counters for reads that missed the execution cache and reached the state provider.
+#[doc(hidden)]
+#[derive(Debug, Default)]
+pub struct ArbMissStats {
+    /// Account reads that reached the provider.
+    pub accounts: AtomicU64,
+    /// Storage reads that reached the provider.
+    pub storage: AtomicU64,
+    /// Bytecode reads that reached the provider.
+    pub code: AtomicU64,
+    /// Wall time spent inside those provider reads.
+    pub nanos: AtomicU64,
+    /// Reads slower than 100 µs (page-cache misses / disk).
+    pub slow: AtomicU64,
+    /// Slowest single read.
+    pub max_nanos: AtomicU64,
+    /// Storage keys that missed (capped), for re-timing against the latest provider.
+    pub keys: std::sync::Mutex<Vec<(Address, StorageKey)>>,
+}
+
+impl ArbMissStats {
+    const KEY_CAP: usize = 4096;
+
+    fn add(&self, started_at: Instant) {
+        let nanos = started_at.elapsed().as_nanos().min(u64::MAX as u128) as u64;
+        self.nanos.fetch_add(nanos, Ordering::Relaxed);
+        if nanos > 100_000 {
+            self.slow.fetch_add(1, Ordering::Relaxed);
+        }
+        self.max_nanos.fetch_max(nanos, Ordering::Relaxed);
+    }
+}
+
+/// Research: a state provider wrapper that counts and times every read reaching it. Placed
+/// *under* the execution cache, every call is a cache miss.
+#[derive(Debug)]
+struct MissTimingStateProvider<P> {
+    inner: P,
+    stats: Arc<ArbMissStats>,
+}
+
+impl<P: AccountReader> AccountReader for MissTimingStateProvider<P> {
+    fn basic_account(&self, address: &Address) -> ProviderResult<Option<Account>> {
+        let started_at = Instant::now();
+        let result = self.inner.basic_account(address);
+        self.stats.add(started_at);
+        self.stats.accounts.fetch_add(1, Ordering::Relaxed);
+        result
+    }
+}
+
+impl<P: BytecodeReader> BytecodeReader for MissTimingStateProvider<P> {
+    fn bytecode_by_hash(&self, code_hash: &B256) -> ProviderResult<Option<Bytecode>> {
+        let started_at = Instant::now();
+        let result = self.inner.bytecode_by_hash(code_hash);
+        self.stats.add(started_at);
+        self.stats.code.fetch_add(1, Ordering::Relaxed);
+        result
+    }
+}
+
+impl<P: StateProvider> StateProvider for MissTimingStateProvider<P> {
+    fn storage(
+        &self,
+        account: Address,
+        storage_key: StorageKey,
+    ) -> ProviderResult<Option<StorageValue>> {
+        let started_at = Instant::now();
+        let result = self.inner.storage(account, storage_key);
+        self.stats.add(started_at);
+        self.stats.storage.fetch_add(1, Ordering::Relaxed);
+        if let Ok(mut keys) = self.stats.keys.try_lock()
+            && keys.len() < ArbMissStats::KEY_CAP
+        {
+            keys.push((account, storage_key));
+        }
+        result
+    }
+}
+
+impl<P: StateRootProvider> StateRootProvider for MissTimingStateProvider<P> {
+    fn state_root(&self, hashed_state: HashedPostState) -> ProviderResult<B256> {
+        self.inner.state_root(hashed_state)
+    }
+
+    fn state_root_from_nodes(&self, input: TrieInput) -> ProviderResult<B256> {
+        self.inner.state_root_from_nodes(input)
+    }
+
+    fn state_root_with_updates(
+        &self,
+        hashed_state: HashedPostState,
+    ) -> ProviderResult<(B256, TrieUpdates)> {
+        self.inner.state_root_with_updates(hashed_state)
+    }
+
+    fn state_root_from_nodes_with_updates(
+        &self,
+        input: TrieInput,
+    ) -> ProviderResult<(B256, TrieUpdates)> {
+        self.inner.state_root_from_nodes_with_updates(input)
+    }
+}
+
+impl<P: StateProofProvider> StateProofProvider for MissTimingStateProvider<P> {
+    fn proof(
+        &self,
+        input: TrieInput,
+        address: Address,
+        slots: &[B256],
+    ) -> ProviderResult<AccountProof> {
+        self.inner.proof(input, address, slots)
+    }
+
+    fn multiproof(
+        &self,
+        input: TrieInput,
+        targets: MultiProofTargets,
+    ) -> ProviderResult<MultiProof> {
+        self.inner.multiproof(input, targets)
+    }
+
+    fn witness(
+        &self,
+        input: TrieInput,
+        target: HashedPostState,
+        mode: ExecutionWitnessMode,
+    ) -> ProviderResult<Vec<Bytes>> {
+        self.inner.witness(input, target, mode)
+    }
+}
+
+impl<P: StorageRootProvider> StorageRootProvider for MissTimingStateProvider<P> {
+    fn storage_root(
+        &self,
+        address: Address,
+        hashed_storage: HashedStorage,
+    ) -> ProviderResult<B256> {
+        self.inner.storage_root(address, hashed_storage)
+    }
+
+    fn storage_proof(
+        &self,
+        address: Address,
+        slot: B256,
+        hashed_storage: HashedStorage,
+    ) -> ProviderResult<StorageProof> {
+        self.inner.storage_proof(address, slot, hashed_storage)
+    }
+
+    fn storage_multiproof(
+        &self,
+        address: Address,
+        slots: &[B256],
+        hashed_storage: HashedStorage,
+    ) -> ProviderResult<StorageMultiProof> {
+        self.inner
+            .storage_multiproof(address, slots, hashed_storage)
+    }
+}
+
+impl<P: BlockHashReader> BlockHashReader for MissTimingStateProvider<P> {
+    fn block_hash(&self, number: BlockNumber) -> ProviderResult<Option<B256>> {
+        self.inner.block_hash(number)
+    }
+
+    fn canonical_hashes_range(
+        &self,
+        start: BlockNumber,
+        end: BlockNumber,
+    ) -> ProviderResult<Vec<B256>> {
+        self.inner.canonical_hashes_range(start, end)
+    }
+}
+
+impl<P: HashedPostStateProvider> HashedPostStateProvider for MissTimingStateProvider<P> {
+    fn hashed_post_state(&self, bundle_state: &reth_revm::db::BundleState) -> HashedPostState {
+        self.inner.hashed_post_state(bundle_state)
+    }
+}
+
+/// Research options for [`reexecute_message_ext`].
+#[doc(hidden)]
+#[derive(Debug, Default)]
+pub struct ArbReexecOptions {
+    /// Count and time reads that miss the cache (wraps the provider under the cache).
+    pub miss_stats: Option<Arc<ArbMissStats>>,
+    /// Return the executed bundle state (to advance a cross-block cache).
+    pub want_bundle: bool,
 }
 
 /// Executes one feed message on top of `parent` exactly like the payload builder does, but with
@@ -717,6 +927,42 @@ pub fn reexecute_message<'a>(
     parent_cache: Option<&ArbReexecCache>,
     skip_state_root: bool,
 ) -> eyre::Result<ArbReexecution> {
+    reexecute_message_ext(
+        evm_config,
+        chain_id,
+        parent,
+        msg,
+        exec_state_provider,
+        trie_state_provider,
+        tx_log_stream,
+        parent_cache,
+        skip_state_root,
+        ArbReexecOptions::default(),
+    )
+}
+
+/// [`reexecute_message`] with research options (cache-miss timing, bundle output).
+#[doc(hidden)]
+#[allow(clippy::too_many_arguments)]
+pub fn reexecute_message_ext<'a>(
+    evm_config: &ArbEvmConfig,
+    chain_id: u64,
+    parent: &SealedHeader<Header>,
+    msg: &BroadcastFeedMessage,
+    exec_state_provider: Box<dyn StateProvider + 'a>,
+    trie_state_provider: Box<dyn StateProvider + 'a>,
+    tx_log_stream: Option<&ArbTxLogBroadcaster>,
+    parent_cache: Option<&ArbReexecCache>,
+    skip_state_root: bool,
+    options: ArbReexecOptions,
+) -> eyre::Result<ArbReexecution> {
+    let exec_state_provider: Box<dyn StateProvider + 'a> = match options.miss_stats {
+        Some(stats) => Box::new(MissTimingStateProvider {
+            inner: exec_state_provider,
+            stats,
+        }),
+        None => exec_state_provider,
+    };
     let exec_state_provider: Box<dyn StateProvider + 'a> = match parent_cache {
         Some(cache) => Box::new(reth_execution_cache::CachedStateProvider::new_with_mode(
             exec_state_provider,
@@ -754,6 +1000,10 @@ pub fn reexecute_message<'a>(
         feed_txs_frame: timing.feed_txs_frame,
         tail_frame: timing.tail_frame,
         finish: timing.finish,
+        execution_setup: timing.execution_setup,
+        bundle: options
+            .want_bundle
+            .then(|| executed.execution_output.state.clone()),
     })
 }
 
