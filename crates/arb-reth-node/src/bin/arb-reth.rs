@@ -15,6 +15,11 @@
 
 #![allow(missing_docs)]
 
+// Research (branch research/bigblock-0924): jemalloc global allocator behind the `jemalloc` feature.
+#[cfg(feature = "jemalloc")]
+#[global_allocator]
+static ALLOC: reth_cli_util::allocator::Allocator = reth_cli_util::allocator::new_allocator();
+
 use arb_reth_node::commands::{
     self,
     dump_blocks::DumpBlocksArgs,

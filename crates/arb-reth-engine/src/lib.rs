@@ -30,8 +30,8 @@ mod storage_v2;
 mod tx_log_stream;
 
 pub use engine::{
-    ArbAppliedMessageTiming, ArbEngineDriver, ArbEngineTuning, ArbReexecCache, ArbReexecution,
-    reexecute_message,
+    ArbAppliedMessageTiming, ArbEngineDriver, ArbEngineTuning, ArbMissStats, ArbReexecCache,
+    ArbReexecOptions, ArbReexecution, reexecute_message, reexecute_message_ext,
     wait_for_head,
 };
 pub use engine_spike::ArbPayloadValidator;
