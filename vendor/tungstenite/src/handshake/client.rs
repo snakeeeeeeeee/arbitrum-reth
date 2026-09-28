@@ -20,7 +20,7 @@ use super::{
 use crate::{
     error::{Error, ProtocolError, Result, SubProtocolError, UrlError},
     handshake::version_as_str,
-    protocol::{Role, WebSocket, WebSocketConfig},
+    protocol::{DeflateParams, Role, WebSocket, WebSocketConfig},
 };
 
 /// Client request type.
@@ -99,9 +99,27 @@ impl<S: Read + Write> HandshakeRole for ClientHandshake<S> {
                     Err(e) => return Err(e),
                 };
 
+                // arbitrum-reth 本地补丁：按服务端响应启用 permessage-deflate 解压。
+                // 没打开 `permessage_deflate` 时完全不看这个头 = 上游原行为。
+                let deflate = if self.config.is_some_and(|config| config.permessage_deflate) {
+                    DeflateParams::from_response_headers(
+                        result
+                            .headers()
+                            .get_all(http::header::SEC_WEBSOCKET_EXTENSIONS)
+                            .iter()
+                            .map(|value| value.as_bytes()),
+                    )?
+                } else {
+                    None
+                };
+
                 debug!("Client handshake done.");
-                let websocket =
+                let mut websocket =
                     WebSocket::from_partially_read(stream, tail, Role::Client, self.config);
+                if let Some(params) = deflate {
+                    debug!("permessage-deflate negotiated: {params:?}");
+                    websocket.enable_permessage_deflate(params);
+                }
                 ProcessingResult::Done((websocket, result))
             }
         })

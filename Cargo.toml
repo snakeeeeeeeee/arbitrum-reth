@@ -1,5 +1,7 @@
 [workspace]
 members = ["crates/*"]
+# vendor/ 里是打过本地补丁的第三方 crate，经下面的 [patch.crates-io] 接入，不是工作区成员。
+exclude = ["vendor"]
 resolver = "2"
 
 # arbitrum-reth: Arbitrum/ArbOS execution wired into reth. Execution engine lives in the
@@ -103,3 +105,12 @@ serde_json = "1.0.145"
 # same relative path, or push the fork and replace this path with its `git`/`rev`.
 [patch."https://github.com/nuntax/arbitrum-revm"]
 arb-revm = { path = "../arbitrum-revm/crates/arb-revm" }
+
+# 官方 feed（Robinhood / Arbitrum 中继）2026-09-17 起强制 permessage-deflate。上游 tungstenite
+# 0.28–0.30 都不支持压缩扩展（RSV1 帧直接判协议错误），这里用仓库内的补丁版：
+#   vendor/tungstenite = crates.io tungstenite 0.28.0 原样 + 接收方向 permessage-deflate
+#   （src/protocol/deflate.rs；只有 WebSocketConfig::permessage_deflate 打开且服务端同意时才启用，
+#   其它情况与上游逐字节同行为）。tokio-tungstenite 0.28 不用改。节点侧开关见 --feed-deflate。
+# 升级 tokio-tungstenite 大版本时，要把补丁搬到对应的 tungstenite 版本上，否则这个 patch 不生效。
+[patch.crates-io]
+tungstenite = { path = "vendor/tungstenite" }

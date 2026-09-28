@@ -2,9 +2,15 @@
 
 pub mod frame;
 
+mod deflate;
 mod message;
 
-pub use self::{frame::CloseFrame, message::Message};
+pub use self::{
+    deflate::{DeflateParams, EXTENSION_NAMES as DEFLATE_EXTENSION_NAMES},
+    frame::CloseFrame,
+    message::Message,
+};
+use self::deflate::Inflater;
 
 use self::{
     frame::{
@@ -90,6 +96,12 @@ pub struct WebSocketConfig {
     /// some popular libraries that are sending unmasked frames, ignoring the RFC.
     /// By default this option is set to `false`, i.e. according to RFC 6455.
     pub accept_unmasked_frames: bool,
+    /// arbitrum-reth 本地补丁：客户端握手时，如果服务端响应里同意了 permessage-deflate
+    /// （或 Arbitrum-permessage-deflate），就启用接收方向的解压。默认 `false` = 上游原行为。
+    ///
+    /// 只管“按响应启用解压”；**报价头 `Sec-WebSocket-Extensions` 由调用方自己放进请求**，
+    /// 这样调用方能决定报哪个扩展名、带哪些参数。
+    pub permessage_deflate: bool,
 }
 
 impl Default for WebSocketConfig {
@@ -101,6 +113,7 @@ impl Default for WebSocketConfig {
             max_message_size: Some(64 << 20),
             max_frame_size: Some(16 << 20),
             accept_unmasked_frames: false,
+            permessage_deflate: false,
         }
     }
 }
@@ -139,6 +152,12 @@ impl WebSocketConfig {
     /// Set [`Self::accept_unmasked_frames`].
     pub fn accept_unmasked_frames(mut self, accept_unmasked_frames: bool) -> Self {
         self.accept_unmasked_frames = accept_unmasked_frames;
+        self
+    }
+
+    /// Set [`Self::permessage_deflate`].
+    pub fn permessage_deflate(mut self, permessage_deflate: bool) -> Self {
+        self.permessage_deflate = permessage_deflate;
         self
     }
 
@@ -224,6 +243,16 @@ impl<Stream> WebSocket<Stream> {
     /// Read the configuration.
     pub fn get_config(&self) -> &WebSocketConfig {
         self.context.get_config()
+    }
+
+    /// arbitrum-reth 本地补丁：启用接收方向的 permessage-deflate 解压（握手已协商好时调用）。
+    pub fn enable_permessage_deflate(&mut self, params: DeflateParams) {
+        self.context.enable_permessage_deflate(params);
+    }
+
+    /// arbitrum-reth 本地补丁：当前连接协商好的 permessage-deflate 参数（没启用则 `None`）。
+    pub fn permessage_deflate(&self) -> Option<&DeflateParams> {
+        self.context.permessage_deflate()
     }
 
     /// Check if it is possible to read messages.
@@ -375,6 +404,10 @@ pub struct WebSocketContext {
     unflushed_additional: bool,
     /// The configuration for the websocket session.
     config: WebSocketConfig,
+    /// arbitrum-reth 本地补丁：协商好的 permessage-deflate（接收方向解压）。
+    inflate: Option<(DeflateParams, Inflater)>,
+    /// 正在拼装的分片消息是否是压缩消息（RSV1 只出现在首帧上）。
+    incomplete_compressed: bool,
 }
 
 impl WebSocketContext {
@@ -408,7 +441,20 @@ impl WebSocketContext {
             additional_send: None,
             unflushed_additional: false,
             config,
+            inflate: None,
+            incomplete_compressed: false,
         }
+    }
+
+    /// arbitrum-reth 本地补丁：启用接收方向的 permessage-deflate 解压。
+    pub fn enable_permessage_deflate(&mut self, params: DeflateParams) {
+        let inflater = Inflater::new(&params);
+        self.inflate = Some((params, inflater));
+    }
+
+    /// arbitrum-reth 本地补丁：当前协商好的 permessage-deflate 参数。
+    pub fn permessage_deflate(&self) -> Option<&DeflateParams> {
+        self.inflate.as_ref().map(|(params, _)| params)
     }
 
     /// Change the configuration.
@@ -638,12 +684,18 @@ impl WebSocketContext {
         // the negotiated extensions defines the meaning of such a nonzero
         // value, the receiving endpoint MUST _Fail the WebSocket
         // Connection_.
-        {
+        //
+        // arbitrum-reth 本地补丁：协商了 permessage-deflate 时，RSV1 允许出现在 Text/Binary
+        // 消息的首帧上，表示“这条消息是压缩的”（RFC 7692 §6）。续帧、控制帧上的 RSV1 仍然报错。
+        let compressed = {
             let hdr = frame.header();
-            if hdr.rsv1 || hdr.rsv2 || hdr.rsv3 {
+            let rsv1_allowed = self.inflate.is_some()
+                && matches!(hdr.opcode, OpCode::Data(OpData::Text | OpData::Binary));
+            if (hdr.rsv1 && !rsv1_allowed) || hdr.rsv2 || hdr.rsv3 {
                 return Err(Error::Protocol(ProtocolError::NonZeroReservedBits));
             }
-        }
+            hdr.rsv1
+        };
 
         if self.role == Role::Client && frame.is_masked() {
             // A client MUST close a connection if it detects a masked frame. (RFC 6455)
@@ -683,7 +735,21 @@ impl WebSocketContext {
                 let payload = match (data, self.incomplete.as_mut()) {
                     (OpData::Continue, None) => Err(ProtocolError::UnexpectedContinueFrame),
                     (OpData::Continue, Some(incomplete)) => {
-                        incomplete.extend(frame.into_payload(), self.config.max_message_size)?;
+                        let payload = frame.into_payload();
+                        if self.incomplete_compressed {
+                            let (_, inflater) =
+                                self.inflate.as_mut().expect("compressed implies inflate");
+                            let limit = self
+                                .config
+                                .max_message_size
+                                .unwrap_or(usize::MAX)
+                                .saturating_sub(incomplete.len());
+                            let mut plain = Vec::new();
+                            inflater.inflate_frame(&payload, fin, &mut plain, limit)?;
+                            incomplete.extend(plain, self.config.max_message_size)?;
+                        } else {
+                            incomplete.extend(payload, self.config.max_message_size)?;
+                        }
                         Ok(None)
                     }
                     (_, Some(_)) => Err(ProtocolError::ExpectedFragment(data)),
@@ -692,8 +758,29 @@ impl WebSocketContext {
                     (OpData::Reserved(i), _) => Err(ProtocolError::UnknownDataFrameType(i)),
                 }?;
 
+                // 压缩消息的首帧：先解压成明文，后面的拼装 / UTF-8 校验 / 大小上限都按明文走。
+                let payload = match payload {
+                    Some((wire, t)) if compressed => {
+                        let (_, inflater) =
+                            self.inflate.as_mut().expect("rsv1 is only accepted with inflate");
+                        let limit = self.config.max_message_size.unwrap_or(usize::MAX);
+                        let mut plain = Vec::new();
+                        inflater.inflate_frame(&wire, fin, &mut plain, limit)?;
+                        self.incomplete_compressed = !fin;
+                        Some((plain.into(), t))
+                    }
+                    Some(other) => {
+                        self.incomplete_compressed = false;
+                        Some(other)
+                    }
+                    None => None,
+                };
+
                 match (payload, fin) {
-                    (None, true) => Ok(Some(self.incomplete.take().unwrap().complete()?)),
+                    (None, true) => {
+                        self.incomplete_compressed = false;
+                        Ok(Some(self.incomplete.take().unwrap().complete()?))
+                    }
                     (None, false) => Ok(None),
                     (Some((payload, t)), true) => {
                         check_max_size(payload.len(), self.config.max_message_size)?;
