@@ -29,13 +29,19 @@ use tokio_tungstenite::{
         Error as WebSocketError, Message,
         client::IntoClientRequest,
         handshake::client::Response,
-        http::{HeaderValue, Request, StatusCode},
+        http::{HeaderValue, Request, StatusCode, header::SEC_WEBSOCKET_EXTENSIONS},
+        protocol::WebSocketConfig,
     },
 };
 
 const FEED_CLIENT_VERSION_HEADER: &str = "arbitrum-feed-client-version";
 const REQUESTED_SEQUENCE_HEADER: &str = "arbitrum-requested-sequence-number";
 const FEED_CLIENT_VERSION: &str = "2";
+/// `--feed-deflate` 时的压缩扩展报价。官方中继 2026-09-17 起不带压缩报价一律 400；它对
+/// `permessage-deflate` 和 `Arbitrum-permessage-deflate` 的应答除名字外完全一样（实测都回
+/// `server_no_context_takeover; client_no_context_takeover`），这里报标准名。不支持压缩的中继
+/// 会忽略这个报价，连接照常是明文 —— 所以对付费 feed 等其它 lane 也无害。
+const DEFLATE_OFFER: &str = "permessage-deflate";
 const MAX_FEED_SOURCES: usize = 64;
 const MAX_RECENT_SEQUENCES: usize = 16_384;
 const INITIAL_RECONNECT_DELAY: Duration = Duration::from_millis(250);
@@ -86,6 +92,8 @@ pub(crate) struct FeedSource {
     url: String,
     display_endpoint: String,
     local_ip: Option<IpAddr>,
+    /// 握手时报 permessage-deflate，服务端同意就在 tungstenite 里解压（`--feed-deflate`）。
+    deflate: bool,
 }
 
 impl fmt::Debug for FeedSource {
@@ -95,12 +103,18 @@ impl fmt::Debug for FeedSource {
             .field("connection", &self.connection)
             .field("display_endpoint", &self.display_endpoint)
             .field("local_ip", &self.local_ip)
+            .field("deflate", &self.deflate)
             .finish_non_exhaustive()
     }
 }
 
 impl FeedSource {
     /// Whether this lane binds a declared local address (only such lanes can rotate).
+    /// `--feed-deflate`：这条 lane 握手时报 permessage-deflate 并按服务端应答解压。
+    pub(crate) fn set_deflate(&mut self, deflate: bool) {
+        self.deflate = deflate;
+    }
+
     pub(crate) fn is_bound(&self) -> bool {
         self.local_ip.is_some()
     }
@@ -283,6 +297,7 @@ pub(crate) fn expand_feed_sources(
                 url: raw_url.clone(),
                 display_endpoint: display_endpoint.clone(),
                 local_ip: None,
+                deflate: false,
             });
             connection = connection.saturating_add(1);
         }
@@ -295,6 +310,7 @@ pub(crate) fn expand_feed_sources(
                     url: raw_url.clone(),
                     display_endpoint: display_endpoint.clone(),
                     local_ip: Some(spec.local_ip),
+                    deflate: false,
                 });
                 connection = connection.saturating_add(1);
             }
@@ -349,6 +365,7 @@ pub(crate) fn expand_feed_sources_with_extra(
                 url: raw_url.clone(),
                 display_endpoint: display_endpoint.clone(),
                 local_ip: None,
+                deflate: false,
             });
         }
     }
@@ -616,7 +633,7 @@ pub(crate) async fn follow(
     tokio::time::sleep(initial_connect_delay(source.ordinal)).await;
     loop {
         let requested_sequence = resume_sequence.load(Ordering::Acquire);
-        let request = match feed_request(&source.url, requested_sequence) {
+        let request = match feed_request(&source.url, requested_sequence, source.deflate) {
             Ok(request) => request,
             Err(err) => {
                 metrics.errors.increment(1);
@@ -636,9 +653,16 @@ pub(crate) async fn follow(
         let mut rate_limited = false;
         let mut rotate_to: Option<IpAddr> = None;
         match connect_source(&source, request).await {
-            Ok((mut websocket, _)) => {
+            Ok((mut websocket, response)) => {
                 metrics.connected.set(1.0);
                 metrics.connections.increment(1);
+                // 服务端同意的压缩扩展（没报价或没同意就是 none）。tungstenite 补丁按同一个头启用解压。
+                let compression = response
+                    .headers()
+                    .get(SEC_WEBSOCKET_EXTENSIONS)
+                    .and_then(|value| value.to_str().ok())
+                    .unwrap_or("none")
+                    .to_owned();
                 reth_tracing::tracing::info!(
                     target: "arb-reth",
                     endpoint = source.endpoint,
@@ -646,6 +670,7 @@ pub(crate) async fn follow(
                     relay = %source.display_endpoint,
                     local_ip = ?source.local_ip,
                     from_seq = requested_sequence,
+                    compression = %compression,
                     "feed: connected to sequencer feed"
                 );
 
@@ -783,8 +808,11 @@ async fn connect_source(
     source: &FeedSource,
     request: Request<()>,
 ) -> Result<(FeedWebSocket, Response), WebSocketError> {
+    // 默认配置与上游相同（帧上限 16 MiB、消息上限 64 MiB）；`--feed-deflate` 只多开解压。
+    // 解压后的明文同样受 64 MiB 消息上限约束（防解压炸弹）。
+    let config = WebSocketConfig::default().permessage_deflate(source.deflate);
     let Some(local_ip) = source.local_ip else {
-        return tokio_tungstenite::connect_async(request).await;
+        return tokio_tungstenite::connect_async_with_config(request, Some(config), false).await;
     };
 
     let parsed = url::Url::parse(&source.url).map_err(|err| {
@@ -842,10 +870,10 @@ async fn connect_source(
         }))
     })?;
 
-    client_async_tls_with_config(request, stream, None, None).await
+    client_async_tls_with_config(request, stream, Some(config), None).await
 }
 
-fn feed_request(url: &str, requested_sequence: u64) -> Result<Request<()>> {
+fn feed_request(url: &str, requested_sequence: u64, deflate: bool) -> Result<Request<()>> {
     let mut request = url
         .into_client_request()
         .map_err(|err| eyre!("build WebSocket request: {err}"))?;
@@ -858,6 +886,11 @@ fn feed_request(url: &str, requested_sequence: u64) -> Result<Request<()>> {
         HeaderValue::from_str(&requested_sequence.to_string())
             .expect("a u64 is always a valid HTTP header value"),
     );
+    if deflate {
+        request
+            .headers_mut()
+            .insert(SEC_WEBSOCKET_EXTENSIONS, HeaderValue::from_static(DEFLATE_OFFER));
+    }
     Ok(request)
 }
 
@@ -1040,12 +1073,18 @@ mod tests {
 
     #[test]
     fn websocket_request_uses_the_live_resume_sequence() {
-        let request = feed_request("wss://example.com/feed", 42).unwrap();
+        let request = feed_request("wss://example.com/feed", 42, false).unwrap();
         assert_eq!(
             request.headers()[FEED_CLIENT_VERSION_HEADER],
             FEED_CLIENT_VERSION
         );
         assert_eq!(request.headers()[REQUESTED_SEQUENCE_HEADER], "42");
+        // 默认不报压缩扩展 = 原行为。
+        assert!(request.headers().get(SEC_WEBSOCKET_EXTENSIONS).is_none());
+
+        let request = feed_request("wss://example.com/feed", 43, true).unwrap();
+        assert_eq!(request.headers()[REQUESTED_SEQUENCE_HEADER], "43");
+        assert_eq!(request.headers()[SEC_WEBSOCKET_EXTENSIONS], DEFLATE_OFFER);
     }
 
     #[test]
@@ -1109,8 +1148,9 @@ mod tests {
             // portable loopback address here. The EC2 deployment check covers distinct ENI
             // addresses; this test exercises the explicit bind + WebSocket handshake path.
             local_ip: Some("127.0.0.1".parse().unwrap()),
+            deflate: false,
         };
-        let request = feed_request(&source.url, 42).unwrap();
+        let request = feed_request(&source.url, 42, false).unwrap();
 
         let (_websocket, _response) = connect_source(&source, request).await.unwrap();
         assert_eq!(
@@ -1166,5 +1206,196 @@ mod tests {
 
         assert_eq!(forwarded, vec![10, 12, 11]);
         assert_eq!(resume.load(Ordering::Acquire), 13);
+    }
+
+    /// 真 feed 抓的压缩帧（2026-09-28 官方中继，`permessage-deflate; server_no_context_takeover`）：
+    /// 每行 `<线上负载 hex> <Python zlib 解压出的明文 hex>`，明文就是 Python 解压中继转发给节点的内容。
+    const DEFLATE_FRAMES: &str = include_str!("../tests/fixtures/feed_deflate_frames.hex");
+
+    fn deflate_fixture() -> Vec<(Vec<u8>, Vec<u8>)> {
+        DEFLATE_FRAMES
+            .lines()
+            .map(|line| {
+                let (wire, plain) = line.split_once(' ').unwrap();
+                (
+                    alloy_primitives::hex::decode(wire).unwrap(),
+                    alloy_primitives::hex::decode(plain).unwrap(),
+                )
+            })
+            .collect()
+    }
+
+    /// 本地假中继：按官方中继的方式应答压缩握手，然后把夹具里的压缩帧（RSV1=1）原样推出去。
+    /// 返回每条连接收到的握手请求原文。
+    async fn serve_compressed_frames(
+        listener: tokio::net::TcpListener,
+        connections: usize,
+    ) -> Vec<String> {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let mut requests = Vec::new();
+        let mut open = Vec::new();
+        for _ in 0..connections {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            let mut buf = [0u8; 4096];
+            while !request.windows(4).any(|w| w == b"\r\n\r\n") {
+                let n = stream.read(&mut buf).await.unwrap();
+                assert!(n > 0, "client closed during handshake");
+                request.extend_from_slice(&buf[..n]);
+            }
+            let request = String::from_utf8(request).unwrap();
+            let key = request
+                .lines()
+                .find_map(|line| {
+                    let (name, value) = line.split_once(':')?;
+                    name.eq_ignore_ascii_case("sec-websocket-key")
+                        .then(|| value.trim().to_owned())
+                })
+                .unwrap();
+            let mut out = format!(
+                "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: upgrade\r\n\
+                 Sec-WebSocket-Accept: {}\r\nSec-WebSocket-Extensions: permessage-deflate; \
+                 server_no_context_takeover; client_no_context_takeover\r\n\r\n",
+                tokio_tungstenite::tungstenite::handshake::derive_accept_key(key.as_bytes())
+            )
+            .into_bytes();
+            for (wire, _) in deflate_fixture() {
+                // FIN + RSV1 + text；服务端帧不加掩码。
+                out.push(0xc1);
+                match wire.len() {
+                    n if n < 126 => out.push(n as u8),
+                    n if n <= usize::from(u16::MAX) => {
+                        out.push(126);
+                        out.extend_from_slice(&(n as u16).to_be_bytes());
+                    }
+                    n => {
+                        out.push(127);
+                        out.extend_from_slice(&(n as u64).to_be_bytes());
+                    }
+                }
+                out.extend_from_slice(&wire);
+            }
+            stream.write_all(&out).await.unwrap();
+            requests.push(request);
+            open.push(stream);
+        }
+        requests
+    }
+
+    #[tokio::test]
+    async fn deflate_lane_yields_the_relay_plaintext_byte_for_byte() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(serve_compressed_frames(listener, 1));
+        let mut sources =
+            expand_feed_sources(&[format!("ws://{address}")], Some(1), &[]).unwrap();
+        sources[0].set_deflate(true);
+        let request = feed_request(&sources[0].url, 42, true).unwrap();
+        let (mut websocket, response) = connect_source(&sources[0], request).await.unwrap();
+        assert!(
+            response.headers()[SEC_WEBSOCKET_EXTENSIONS]
+                .to_str()
+                .unwrap()
+                .starts_with("permessage-deflate")
+        );
+
+        use futures_util::StreamExt;
+        for (_, plain) in deflate_fixture() {
+            match websocket.next().await.unwrap().unwrap() {
+                Message::Text(text) => assert_eq!(text.as_bytes(), plain.as_slice()),
+                other => panic!("expected a text frame, got {other:?}"),
+            }
+        }
+        let requests = server.await.unwrap();
+        let request = requests[0].to_ascii_lowercase();
+        assert!(request.contains("sec-websocket-extensions: permessage-deflate"));
+        assert!(request.contains("arbitrum-requested-sequence-number: 42"));
+    }
+
+    #[tokio::test]
+    async fn deflate_lanes_race_through_the_coordinator() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(serve_compressed_frames(listener, 2));
+        let mut sources =
+            expand_feed_sources(&[format!("ws://{address}")], Some(2), &[]).unwrap();
+        for source in &mut sources {
+            source.set_deflate(true);
+        }
+        let expected: Vec<serde_json::Value> = deflate_fixture()
+            .iter()
+            .flat_map(|(_, plain)| serde_json::from_slice::<Root>(plain).unwrap().messages)
+            .flatten()
+            .map(|message| serde_json::to_value(message).unwrap())
+            .collect();
+
+        let (ingress_tx, ingress_rx) = ingress_channel();
+        let (output_tx, mut output_rx) = mpsc::channel(64);
+        let key = |v: &serde_json::Value| v["sequenceNumber"].as_u64().unwrap();
+        // 夹具是抽出来的 10 帧、序号不连续：续传游标从最小序号起，只越过连续前缀。
+        let first = expected.iter().map(key).min().unwrap();
+        let mut expected_resume = first;
+        while expected.iter().any(|v| key(v) == expected_resume) {
+            expected_resume += 1;
+        }
+        let resume = Arc::new(AtomicU64::new(first));
+        let coordinator = tokio::spawn(coordinate(
+            ingress_rx,
+            output_tx,
+            FeedLatencyTracker::new(),
+            resume.clone(),
+            None,
+            None,
+            None,
+        ));
+        let lanes: Vec<_> = sources
+            .into_iter()
+            .map(|source| tokio::spawn(follow(source, ingress_tx.clone(), resume.clone(), None)))
+            .collect();
+        drop(ingress_tx);
+
+        let mut forwarded = Vec::new();
+        while forwarded.len() < expected.len() {
+            let message = tokio::time::timeout(Duration::from_secs(20), output_rx.recv())
+                .await
+                .expect("coordinator output")
+                .unwrap();
+            forwarded.push(serde_json::to_value(message).unwrap());
+        }
+        let requests = server.await.unwrap();
+        // 两条 lane 都带着压缩报价和续传序号来握手；第二条晚 1 秒起（错峰），带的是当时的续传游标。
+        assert_eq!(requests.len(), 2);
+        let requested: Vec<u64> = requests
+            .iter()
+            .map(|request| {
+                let request = request.to_ascii_lowercase();
+                assert!(request.contains("sec-websocket-extensions: permessage-deflate"));
+                request
+                    .lines()
+                    .find_map(|line| line.strip_prefix("arbitrum-requested-sequence-number: "))
+                    .unwrap()
+                    .trim()
+                    .parse()
+                    .unwrap()
+            })
+            .collect();
+        assert_eq!(requested[0], first);
+        assert!(requested[1] >= first && requested[1] <= expected_resume);
+        let mut forwarded_sorted = forwarded.clone();
+        let mut expected_sorted = expected.clone();
+        forwarded_sorted.sort_by_key(key);
+        expected_sorted.sort_by_key(key);
+        assert_eq!(forwarded_sorted, expected_sorted);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(300), output_rx.recv())
+                .await
+                .is_err(),
+            "the second lane's copies must be deduplicated"
+        );
+        assert_eq!(resume.load(Ordering::Acquire), expected_resume);
+        for lane in lanes {
+            lane.abort();
+        }
+        coordinator.abort();
     }
 }

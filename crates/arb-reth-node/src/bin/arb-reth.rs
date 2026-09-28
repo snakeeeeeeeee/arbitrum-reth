@@ -12,6 +12,7 @@
 //! - `rewind`           unwind the database to an earlier L2 block after a divergence
 //! - `dump-blocks`      dump block headers + tx hashes + receipt status
 //! - `replay-bench`     re-execute recorded feed messages read-only, time production, check hashes
+//! - `feed-probe`       run only the sequencer-feed client (lanes + dedup), log first arrivals
 
 #![allow(missing_docs)]
 
@@ -23,6 +24,7 @@ static ALLOC: reth_cli_util::allocator::Allocator = reth_cli_util::allocator::ne
 use arb_reth_node::commands::{
     self,
     dump_blocks::DumpBlocksArgs,
+    feed_probe::FeedProbeArgs,
     genesis::{GenesisVerifyArgs, GenesisVerifyExportArgs},
     node::{ArbChainSpecParser, ArbNodeArgs},
     replay_bench::ReplayBenchArgs,
@@ -93,6 +95,8 @@ enum Command {
     DumpBlocks(DumpBlocksArgs),
     /// Re-execute recorded feed messages (read-only), time production, check block hashes.
     ReplayBench(ReplayBenchArgs),
+    /// Run only the sequencer-feed client (no database, no execution) and log first arrivals.
+    FeedProbe(FeedProbeArgs),
 }
 
 #[derive(Debug, Args)]
@@ -239,6 +243,7 @@ fn main() -> eyre::Result<()> {
         Command::Rewind(args) => commands::rewind::run(args),
         Command::DumpBlocks(args) => commands::dump_blocks::run(args),
         Command::ReplayBench(args) => commands::replay_bench::run(args),
+        Command::FeedProbe(args) => commands::feed_probe::run(args),
     }
 }
 

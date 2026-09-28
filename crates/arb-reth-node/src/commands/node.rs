@@ -247,6 +247,12 @@ pub struct ArbNodeArgs {
     )]
     feed_rotate_window_secs: u64,
 
+    /// 握手时报 WebSocket 压缩扩展 permessage-deflate，服务端同意就在节点里解压（RFC 7692）。
+    /// 官方 feed 自 2026-09-17 起不带压缩报价一律 400，打开它才能不经解压中继直连。对所有 lane
+    /// 生效；不支持压缩的中继会忽略报价，照常明文。默认关 = 原行为。
+    #[arg(long = "feed-deflate")]
+    feed_deflate: bool,
+
     /// Skip the L1-derivation catch-up loop, making `--feed-url` the sole block source. Genesis is
     /// still bootstrapped from `--l1-rpc` (chain id, spec, initial L1 base fee). Use this to follow a
     /// chain purely through its sequencer feed: the driver applies each feed message as the next
@@ -720,13 +726,16 @@ async fn launch(
     bootstrap: NodeBootstrap,
 ) -> eyre::Result<()> {
     let task_executor = builder.task_executor().clone();
-    let feed_sources = feed::expand_feed_sources_with_extra(
+    let mut feed_sources = feed::expand_feed_sources_with_extra(
         &args.feed_urls,
         args.feed_connections,
         &args.feed_sources,
         &args.feed_extra_urls,
         args.feed_extra_connections,
     )?;
+    for source in &mut feed_sources {
+        source.set_deflate(args.feed_deflate);
+    }
     if args.no_l1_derive && feed_sources.is_empty() {
         return Err(eyre::eyre!(
             "--no-l1-derive requires at least one --feed-url"
@@ -1276,6 +1285,7 @@ mod tests {
         assert!(command.ext.feed_spare_ips.is_empty());
         assert_eq!(command.ext.feed_rotate_lag_ms, 30);
         assert_eq!(command.ext.feed_rotate_window_secs, 600);
+        assert!(!command.ext.feed_deflate, "--feed-deflate defaults off (relay-shim era behaviour)");
     }
 
     #[test]
@@ -1297,6 +1307,7 @@ mod tests {
             "45",
             "--feed-rotate-window-secs",
             "900",
+            "--feed-deflate",
             "--mev-tx-log-ipc",
             "/tmp/mev-tx-logs.sock",
         ])
@@ -1319,6 +1330,7 @@ mod tests {
         );
         assert_eq!(command.ext.feed_rotate_lag_ms, 45);
         assert_eq!(command.ext.feed_rotate_window_secs, 900);
+        assert!(command.ext.feed_deflate);
         assert_eq!(
             command.ext.mev_tx_log_ipc,
             Some(PathBuf::from("/tmp/mev-tx-logs.sock"))

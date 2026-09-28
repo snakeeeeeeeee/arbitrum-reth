@@ -3,6 +3,7 @@
 //! CLI and calls into these.
 
 pub mod dump_blocks;
+pub mod feed_probe;
 pub mod genesis;
 pub mod node;
 pub mod replay_bench;
