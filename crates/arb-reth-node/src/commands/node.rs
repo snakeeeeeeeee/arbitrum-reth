@@ -233,7 +233,9 @@ pub struct ArbNodeArgs {
     /// 慢 —— 滚动中位落后同 relay 最快 lane ≥ `--feed-rotate-lag-ms`，观察满
     /// `--feed-rotate-window-secs`（旧地址回池尾；全局两次慢换票至少隔 60 秒）；
     /// 失败 —— 收到 403，或同一地址连续失败 `--feed-rotate-fail-after` 次（不算 429）且别的 lane
-    /// 连得上（旧地址冷却 30 分钟，403 冷却 6 小时后才回池）。与 `--feed-source` 重复的地址忽略。
+    /// 连得上（旧地址冷却 30 分钟，403 冷却 60 分钟后才回池）。慢换票只换同地址族（IPv4↔IPv4、
+    /// IPv6↔IPv6），且只换到「没测过」或「测过且明显更快（≥ 阈值一半）」的地址，没有就不换；
+    /// 每个地址测到的落后值记 6 小时。失败换票不限地址族。与 `--feed-source` 重复的地址忽略。
     /// 不给这个参数 = 不换票（排名日志照打）。
     #[arg(long = "feed-spare-ip", value_name = "IP", action = clap::ArgAction::Append)]
     feed_spare_ips: Vec<std::net::IpAddr>,

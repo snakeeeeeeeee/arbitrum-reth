@@ -990,9 +990,9 @@ pub(crate) async fn coordinate(
                 // decode and publish the early manifest here. Decoding therefore never delays
                 // block production, and the manifest still leaves long before the engine's own
                 // (late) manifest, which waits for the payload-job round trip.
-                let early = tap.as_ref().filter(|tap| {
-                    tap.early_feed_txs && tap.broadcaster.has_subscribers()
-                });
+                let early = tap
+                    .as_ref()
+                    .filter(|tap| tap.early_feed_txs && tap.broadcaster.has_subscribers());
                 let early_message = early.map(|_| item.message.clone());
                 // #3: queue an owned copy for the background precompute (decode, sender recovery,
                 // encoding, brotli length) that the payload builder picks up for this sequence.
@@ -1464,9 +1464,10 @@ fn feed_request(url: &str, requested_sequence: u64, deflate: bool) -> Result<Req
             .expect("a u64 is always a valid HTTP header value"),
     );
     if deflate {
-        request
-            .headers_mut()
-            .insert(SEC_WEBSOCKET_EXTENSIONS, HeaderValue::from_static(DEFLATE_OFFER));
+        request.headers_mut().insert(
+            SEC_WEBSOCKET_EXTENSIONS,
+            HeaderValue::from_static(DEFLATE_OFFER),
+        );
     }
     Ok(request)
 }
@@ -1570,7 +1571,10 @@ mod tests {
         let sources = expand_feed_sources_with_extra(
             &["wss://public.example/feed".into()],
             None,
-            &["192.0.2.10=2".parse().unwrap(), "192.0.2.11=1".parse().unwrap()],
+            &[
+                "192.0.2.10=2".parse().unwrap(),
+                "192.0.2.11=1".parse().unwrap(),
+            ],
             &["wss://paid.example/ws/ultra/secret-token".into()],
             1,
         )
@@ -1598,22 +1602,26 @@ mod tests {
         assert_eq!(plain.len(), 2);
 
         // Zero connections for a declared extra, or a bad URL, is a configuration error.
-        assert!(expand_feed_sources_with_extra(
-            &["wss://public.example/feed".into()],
-            None,
-            &[],
-            &["wss://paid.example/ws".into()],
-            0,
-        )
-        .is_err());
-        assert!(expand_feed_sources_with_extra(
-            &["wss://public.example/feed".into()],
-            None,
-            &[],
-            &["https://paid.example/ws".into()],
-            1,
-        )
-        .is_err());
+        assert!(
+            expand_feed_sources_with_extra(
+                &["wss://public.example/feed".into()],
+                None,
+                &[],
+                &["wss://paid.example/ws".into()],
+                0,
+            )
+            .is_err()
+        );
+        assert!(
+            expand_feed_sources_with_extra(
+                &["wss://public.example/feed".into()],
+                None,
+                &[],
+                &["https://paid.example/ws".into()],
+                1,
+            )
+            .is_err()
+        );
     }
 
     #[test]
@@ -2338,8 +2346,7 @@ mod tests {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let server = tokio::spawn(serve_compressed_frames(listener, 1));
-        let mut sources =
-            expand_feed_sources(&[format!("ws://{address}")], Some(1), &[]).unwrap();
+        let mut sources = expand_feed_sources(&[format!("ws://{address}")], Some(1), &[]).unwrap();
         sources[0].set_deflate(true);
         let request = feed_request(&sources[0].url, 42, true).unwrap();
         let (mut websocket, response) = connect_source(&sources[0], request).await.unwrap();
@@ -2368,8 +2375,7 @@ mod tests {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let server = tokio::spawn(serve_compressed_frames(listener, 2));
-        let mut sources =
-            expand_feed_sources(&[format!("ws://{address}")], Some(2), &[]).unwrap();
+        let mut sources = expand_feed_sources(&[format!("ws://{address}")], Some(2), &[]).unwrap();
         for source in &mut sources {
             source.set_deflate(true);
         }
