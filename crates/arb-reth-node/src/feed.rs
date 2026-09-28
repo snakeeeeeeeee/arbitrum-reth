@@ -318,37 +318,49 @@ impl RotationPool {
         }
     }
 
-    /// 给一条慢 lane（当前地址 `current`，落后最快 lane `current_behind_ms`）挑一张备用票：
-    /// 只看与 `current` **同地址族**的备用地址；先取排在最前的「没测过（或记忆已过期）」的，
-    /// 其次取「测过且落后 ≤ `current_behind_ms - margin_ms`」里最快的；都没有就不换（返回
-    /// `None`，避免在一样慢的票之间空转）。取到的地址记为在用，返回它和它的记忆值。
+    /// 给一条慢 lane（当前地址 `current`，落后最快 lane `current_behind_ms`）挑一张备用票，
+    /// 「明显更快」= 记忆值 ≤ `current_behind_ms - margin_ms`：
+    /// 1. 已知好票（明显更快且记忆值 < `good_ms`，即在最快 lane 的阈值以内）里最快的，**不限地址族**
+    ///    —— 例如 IPv4 lane 因 403 换到 IPv6 后，冷却结束回池的那个 IPv4（之前测过是好票）能换回来；
+    /// 2. 同地址族里排在最前的「没测过（或记忆已过期）」的；
+    /// 3. 同地址族里明显更快的里最快的。
+    ///
+    /// 都没有就不换（返回 `None`，避免在一样慢的票之间空转）。取到的地址记为在用，返回它和它的记忆值。
     fn take_for_slow_at(
         &self,
         current: IpAddr,
         current_behind_ms: u32,
         margin_ms: u32,
+        good_ms: u32,
         now: Instant,
     ) -> Option<(IpAddr, Option<u32>)> {
         let picked = {
             let mut state = self.state.lock().ok()?;
             state.release_expired(now);
             let same_family = |ip: &IpAddr| ip.is_ipv4() == current.is_ipv4();
-            let unmeasured = state
-                .spare
-                .iter()
-                .position(|ip| same_family(ip) && state.recalled(*ip, now).is_none());
-            let index = unmeasured.or_else(|| {
-                let ceiling = current_behind_ms.checked_sub(margin_ms)?;
+            let ceiling = current_behind_ms.checked_sub(margin_ms);
+            // 明显更快的已测地址里最快的下标；`keep` 决定看哪些地址。
+            let fastest_known = |keep: &dyn Fn(&IpAddr, u32) -> bool| {
+                let ceiling = ceiling?;
                 state
                     .spare
                     .iter()
                     .enumerate()
-                    .filter(|(_, ip)| same_family(ip))
-                    .filter_map(|(index, ip)| Some((state.recalled(*ip, now)?, index)))
-                    .filter(|(behind, _)| *behind <= ceiling)
+                    .filter_map(|(index, ip)| {
+                        let behind = state.recalled(*ip, now)?;
+                        (behind <= ceiling && keep(ip, behind)).then_some((behind, index))
+                    })
                     .min()
                     .map(|(_, index)| index)
-            })?;
+            };
+            let index = fastest_known(&|_, behind| behind < good_ms)
+                .or_else(|| {
+                    state
+                        .spare
+                        .iter()
+                        .position(|ip| same_family(ip) && state.recalled(*ip, now).is_none())
+                })
+                .or_else(|| fastest_known(&|ip, _| same_family(ip)))?;
             let ip = state.spare.remove(index)?;
             *state.in_use.entry(ip).or_default() += 1;
             (ip, state.recalled(ip, now))
@@ -594,8 +606,9 @@ fn remember_lanes(pool: &RotationPool, stats: &[LaneStat], now: Instant) {
     }
 }
 
-/// 挑一次慢换票：从落后最多的慢 lane 起，找第一条在备用池里有合适同族票的（见
-/// [`RotationPool::take_for_slow_at`]；「明显更快」= 至少快 `lag / 2`）。都没有就不换。
+/// 挑一次慢换票：从落后最多的慢 lane 起，找第一条在备用池里有合适票的（见
+/// [`RotationPool::take_for_slow_at`]；「明显更快」= 至少快 `lag / 2`，「好票」= 落后 < `lag`）。
+/// 都没有就不换。
 /// 返回 (lane, 新地址, 新地址的记忆值)；新地址已记为在用。
 fn pick_slow_rotation<'a>(
     stats: &'a [LaneStat],
@@ -604,12 +617,14 @@ fn pick_slow_rotation<'a>(
     rotatable: impl Fn(usize) -> bool,
     now: Instant,
 ) -> Option<(&'a LaneStat, IpAddr, Option<u32>)> {
-    let margin_ms = (duration_ms(lag) / 2).max(1);
+    let good_ms = duration_ms(lag);
+    let margin_ms = (good_ms / 2).max(1);
     slow_lanes(stats, lag, rotatable)
         .into_iter()
         .find_map(|slow| {
             let (current, behind) = (slow.ip?, slow.behind_best_ms?);
-            let (new_ip, recalled) = pool.take_for_slow_at(current, behind, margin_ms, now)?;
+            let (new_ip, recalled) =
+                pool.take_for_slow_at(current, behind, margin_ms, good_ms, now)?;
             Some((slow, new_ip, recalled))
         })
 }
@@ -2009,22 +2024,32 @@ mod tests {
         // 同族：IPv4 lane 跳过排在前面的 IPv6 备用票；IPv6 lane 池里只有 IPv4 时不换。
         let pool = RotationPool::new(vec![ip("2001:db8::2"), ip("192.0.2.20")], &v4_lane, 3);
         assert_eq!(
-            pool.take_for_slow_at(ip("192.0.2.10"), 20, margin, now),
+            pool.take_for_slow_at(ip("192.0.2.10"), 20, margin, 8, now),
             Some((ip("192.0.2.20"), None))
         );
         pool.release_at(ip("192.0.2.20"), None, now);
         pool.take_at(now); // 取走 2001:db8::2，池里只剩 IPv4
         assert_eq!(
-            pool.take_for_slow_at(ip("2001:db8::1"), 30, margin, now),
+            pool.take_for_slow_at(ip("2001:db8::1"), 30, margin, 8, now),
             None
         );
 
-        // 没测过的优先于测过的好票（先测没测过的，才知道谁快）。
-        let pool = RotationPool::new(vec![ip("192.0.2.20"), ip("192.0.2.21")], &v4_lane, 3);
-        pool.remember_at(ip("192.0.2.20"), 0, now);
+        // 没测过的优先于「测过、明显更快但还不算好票」的（先测没测过的，才知道谁快）；
+        // 已知好票（< 8 ms）则排在没测过的前面。
+        let pool = RotationPool::new(
+            vec![ip("192.0.2.20"), ip("192.0.2.21"), ip("192.0.2.22")],
+            &v4_lane,
+            3,
+        );
+        pool.remember_at(ip("192.0.2.20"), 10, now);
         assert_eq!(
-            pool.take_for_slow_at(ip("192.0.2.10"), 20, margin, now),
+            pool.take_for_slow_at(ip("192.0.2.10"), 20, margin, 8, now),
             Some((ip("192.0.2.21"), None))
+        );
+        pool.remember_at(ip("192.0.2.22"), 2, now);
+        assert_eq!(
+            pool.take_for_slow_at(ip("192.0.2.10"), 20, margin, 8, now),
+            Some((ip("192.0.2.22"), Some(2)))
         );
 
         // 全测过：只换「明显更快」（≤ 当前 − margin）里最快的；已知一样慢或更慢就不换。
@@ -2037,12 +2062,12 @@ mod tests {
         pool.remember_at(ip("192.0.2.21"), 25, now);
         pool.remember_at(ip("192.0.2.22"), 17, now);
         assert_eq!(
-            pool.take_for_slow_at(ip("192.0.2.10"), 20, margin, now),
+            pool.take_for_slow_at(ip("192.0.2.10"), 20, margin, 8, now),
             None,
             "17/18 ms are not clearly better than 20 ms"
         );
         assert_eq!(
-            pool.take_for_slow_at(ip("192.0.2.10"), 24, margin, now),
+            pool.take_for_slow_at(ip("192.0.2.10"), 24, margin, 8, now),
             Some((ip("192.0.2.22"), Some(17)))
         );
         assert_eq!(
@@ -2054,8 +2079,28 @@ mod tests {
         // 记忆 6 小时后过期 = 视为没测过，又可以抽。
         let later = now + IP_MEMORY_TTL;
         assert_eq!(
-            pool.take_for_slow_at(ip("192.0.2.10"), 10, margin, later),
+            pool.take_for_slow_at(ip("192.0.2.10"), 10, margin, 8, later),
             Some((ip("192.0.2.20"), None))
+        );
+
+        // 已知好票（< 8 ms）不限地址族且优先于没测过的：IPv6 lane 换回测过的好 IPv4。
+        let pool = RotationPool::new(
+            vec![ip("2001:db8::2"), ip("192.0.2.20"), ip("192.0.2.21")],
+            &v4_lane,
+            3,
+        );
+        pool.remember_at(ip("192.0.2.21"), 1, now);
+        pool.remember_at(ip("192.0.2.20"), 6, now);
+        assert_eq!(
+            pool.take_for_slow_at(ip("2001:db8::1"), 20, margin, 8, now),
+            Some((ip("192.0.2.21"), Some(1)))
+        );
+        // 已知但不够好（≥ 8 ms）的异族票不换：IPv4 lane 不会换到测过 10 ms 的 IPv6。
+        let pool = RotationPool::new(vec![ip("2001:db8::2")], &v4_lane, 3);
+        pool.remember_at(ip("2001:db8::2"), 10, now);
+        assert_eq!(
+            pool.take_for_slow_at(ip("192.0.2.10"), 30, margin, 8, now),
+            None
         );
     }
 
