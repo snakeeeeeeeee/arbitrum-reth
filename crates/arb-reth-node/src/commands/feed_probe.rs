@@ -39,12 +39,24 @@ pub struct FeedProbeArgs {
     feed_spare_ips: Vec<IpAddr>,
 
     /// 同 `node --feed-rotate-lag-ms`。
-    #[arg(long = "feed-rotate-lag-ms", value_name = "MS", default_value_t = 30)]
+    #[arg(long = "feed-rotate-lag-ms", value_name = "MS", default_value_t = 8)]
     feed_rotate_lag_ms: u64,
 
     /// 同 `node --feed-rotate-window-secs`。
-    #[arg(long = "feed-rotate-window-secs", value_name = "SECS", default_value_t = 600)]
+    #[arg(
+        long = "feed-rotate-window-secs",
+        value_name = "SECS",
+        default_value_t = 240
+    )]
     feed_rotate_window_secs: u64,
+
+    /// 同 `node --feed-rotate-fail-after`。
+    #[arg(
+        long = "feed-rotate-fail-after",
+        value_name = "COUNT",
+        default_value_t = 3
+    )]
+    feed_rotate_fail_after: u32,
 
     /// 同 `node --feed-deflate`：握手报 permessage-deflate，按服务端应答解压。
     #[arg(long = "feed-deflate")]
@@ -96,7 +108,11 @@ async fn probe(args: FeedProbeArgs) -> eyre::Result<()> {
             }
         }
         feed::Rotation {
-            pool: feed::RotationPool::new(args.feed_spare_ips.clone()),
+            pool: feed::RotationPool::new(
+                args.feed_spare_ips.clone(),
+                &sources,
+                args.feed_rotate_fail_after,
+            ),
             policy: feed::RotationPolicy {
                 lag: Duration::from_millis(args.feed_rotate_lag_ms),
                 window: Duration::from_secs(args.feed_rotate_window_secs),

@@ -3,6 +3,12 @@
 //! Every configured WebSocket races to deliver the next sequence. A single coordinator forwards
 //! only the first decoded copy to the engine, keeping duplicate work off the latency-sensitive
 //! execution channel.
+//!
+//! 换票（有 `--feed-spare-ip` 时）：中继按源 IP 分配后端副本，每条连接的快慢基本固定。协调器按
+//! 每条 lane 的滚动中位落后（相对每个 seq 最先到的那份，赢了记 0）给同一 relay 的 lane 排名，比最快
+//! lane 慢 ≥ `--feed-rotate-lag-ms` 且观察满 `--feed-rotate-window-secs` 的换到备用地址（全局两次至少
+//! 隔 60 秒）；lane 自己在 403 或同一地址连续失败 `--feed-rotate-fail-after` 次时换票，换下的地址冷却
+//! 后才回池。每 10 分钟打一行 `feed: lane ranking`。换票不碰「按 seq 取最早」的数据路径。
 
 use crate::metrics::FeedLatencyTracker;
 use arbitrum_alloy_sequencer::sequencer::feed::{BroadcastFeedMessage, Root};
@@ -15,7 +21,7 @@ use std::{
     str::FromStr,
     sync::{
         Arc, Mutex,
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicU64, AtomicUsize, Ordering},
     },
     time::{Duration, Instant},
 };
@@ -49,9 +55,21 @@ const MAX_RECONNECT_DELAY: Duration = Duration::from_secs(8);
 const INITIAL_RATE_LIMIT_DELAY: Duration = Duration::from_secs(30);
 const MAX_RATE_LIMIT_DELAY: Duration = Duration::from_secs(300);
 /// Global floor between two lane rotations, so one bad minute cannot re-deal every ticket at once.
+/// 只管「慢」换票；连接失败换票不受它限制（失败的 lane 本来就一条消息都收不到）。
 const ROTATION_GLOBAL_COOLDOWN: Duration = Duration::from_secs(60);
 /// How often a lane's rolling lag is re-evaluated against the rotation policy.
 const ROTATION_CHECK_INTERVAL: Duration = Duration::from_secs(5);
+/// 每隔多久打一行 `feed: lane ranking`（每条 lane 的源 IP、滚动中位、落后最快 lane 多少）。
+const LANE_REPORT_INTERVAL: Duration = Duration::from_secs(600);
+/// 每条 lane 滚动窗口最多留的样本数（~10 条/秒 × 240 秒 = 2,400；上限只防窗口被设得很长时占内存）。
+const MAX_LANE_SAMPLES: usize = 16_384;
+/// 连续失败被换下的源 IP 冷却多久才回备用池。
+const FAILED_IP_COOLDOWN: Duration = Duration::from_secs(30 * 60);
+/// 收到 403（Cloudflare 封 IP）被换下的源 IP 冷却多久才回备用池。
+const FORBIDDEN_IP_COOLDOWN: Duration = Duration::from_secs(6 * 60 * 60);
+/// 没开换票（没有 `--feed-spare-ip`）时排名日志用的窗口与最少样本（与换票默认值一致）。
+const DEFAULT_RANKING_WINDOW: Duration = Duration::from_secs(240);
+const DEFAULT_RANKING_MIN_SAMPLES: usize = 200;
 
 /// Counted source-address declaration accepted by `--feed-source IP=COUNT`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -109,55 +127,202 @@ impl fmt::Debug for FeedSource {
 }
 
 impl FeedSource {
-    /// Whether this lane binds a declared local address (only such lanes can rotate).
     /// `--feed-deflate`：这条 lane 握手时报 permessage-deflate 并按服务端应答解压。
     pub(crate) fn set_deflate(&mut self, deflate: bool) {
         self.deflate = deflate;
     }
 
+    /// Whether this lane binds a declared local address (only such lanes can rotate).
     pub(crate) fn is_bound(&self) -> bool {
         self.local_ip.is_some()
     }
 }
 
-/// Spare local addresses a persistently slow lane can rotate onto. The relay assigns its replica
+/// Spare local addresses a slow or failing lane can rotate onto. The relay assigns its replica
 /// per source IP, so every address is an independent lottery ticket; rotating a lane re-deals its
 /// ticket without touching the first-wins race.
+///
+/// 池里只放「当前没有 lane 在用」的地址：同一个 IP 被两条 lane 用着时，一条换走不会把它放回池里
+/// （否则会被发给第三条 lane，三条 lane 抽的是同一张票）。连接失败被换下的地址先进冷却区，到点才回池尾。
 pub(crate) struct RotationPool {
-    spare: Mutex<VecDeque<IpAddr>>,
+    state: Mutex<PoolState>,
+    /// 同一源 IP 连续失败（不算 429）几次就换票；0 = 不因失败换票。
+    fail_after: u32,
+    /// 当前连着的可换票 lane 数：失败换票要求别的 lane 连得上（整个中继挂了时不白白烧掉备用票）。
+    connected_lanes: AtomicUsize,
     spare_size: Gauge,
+    cooling_size: Gauge,
     rotations: Counter,
+    failure_rotations: Counter,
 }
 
-impl RotationPool {
-    pub(crate) fn new(spare: Vec<IpAddr>) -> Arc<Self> {
-        let size = spare.len() as f64;
-        let pool = Self {
-            spare: Mutex::new(spare.into_iter().collect()),
-            spare_size: metrics::gauge!("arb_reth.feed.rotation_spare_addresses"),
-            rotations: metrics::counter!("arb_reth.feed.rotations_total"),
-        };
-        pool.spare_size.set(size);
-        Arc::new(pool)
-    }
+#[derive(Default)]
+struct PoolState {
+    spare: VecDeque<IpAddr>,
+    /// (地址, 可回池时刻)
+    cooling: Vec<(IpAddr, Instant)>,
+    /// 每个地址当前被几条 lane 用着。
+    in_use: BTreeMap<IpAddr, usize>,
+}
 
-    fn take(&self) -> Option<IpAddr> {
-        let mut spare = self.spare.lock().ok()?;
-        let ip = spare.pop_front();
-        self.spare_size.set(spare.len() as f64);
-        ip
-    }
-
-    fn give_back(&self, ip: IpAddr) {
-        if let Ok(mut spare) = self.spare.lock() {
-            spare.push_back(ip);
-            self.spare_size.set(spare.len() as f64);
+impl PoolState {
+    fn release_expired(&mut self, now: Instant) {
+        let mut index = 0;
+        while index < self.cooling.len() {
+            if self.cooling[index].1 <= now {
+                let (ip, _) = self.cooling.remove(index);
+                if !self.spare.contains(&ip) && !self.in_use.contains_key(&ip) {
+                    self.spare.push_back(ip);
+                }
+            } else {
+                index += 1;
+            }
         }
     }
 }
 
-/// When a bound lane's rolling median duplicate lag stays at or above `lag` for a full `window`
-/// (with at least `min_samples` duplicates), the coordinator hands it a spare address.
+/// 换票原因（写进日志）。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RotateReason {
+    /// 滚动中位落后最快 lane ≥ 阈值持续一个窗口。
+    Slow,
+    /// 同一 IP 连续失败 `fail_after` 次（不含 429）。
+    Failed,
+    /// 收到 403。
+    Forbidden,
+}
+
+impl RotateReason {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Slow => "slow",
+            Self::Failed => "failed",
+            Self::Forbidden => "forbidden",
+        }
+    }
+
+    /// 被换下的地址回池前的冷却：慢的直接回池尾（换一条 lane 还可能是好票），失败 / 403 冷却。
+    fn cooldown(self) -> Option<Duration> {
+        match self {
+            Self::Slow => None,
+            Self::Failed => Some(FAILED_IP_COOLDOWN),
+            Self::Forbidden => Some(FORBIDDEN_IP_COOLDOWN),
+        }
+    }
+}
+
+impl RotationPool {
+    /// `spare` 去重，并剔除已经被 `sources` 里某条 lane 绑定的地址（那不是备用票，是同一张票）。
+    pub(crate) fn new(spare: Vec<IpAddr>, sources: &[FeedSource], fail_after: u32) -> Arc<Self> {
+        let mut state = PoolState::default();
+        for ip in sources.iter().filter_map(|source| source.local_ip) {
+            *state.in_use.entry(ip).or_default() += 1;
+        }
+        for ip in spare {
+            if state.in_use.contains_key(&ip) || state.spare.contains(&ip) {
+                reth_tracing::tracing::warn!(
+                    target: "arb-reth",
+                    ip = %ip,
+                    "feed: --feed-spare-ip duplicates a --feed-source or another spare; ignored"
+                );
+                continue;
+            }
+            state.spare.push_back(ip);
+        }
+        let pool = Self {
+            fail_after,
+            connected_lanes: AtomicUsize::new(0),
+            spare_size: metrics::gauge!("arb_reth.feed.rotation_spare_addresses"),
+            cooling_size: metrics::gauge!("arb_reth.feed.rotation_cooling_addresses"),
+            rotations: metrics::counter!("arb_reth.feed.rotations_total"),
+            failure_rotations: metrics::counter!("arb_reth.feed.failure_rotations_total"),
+            state: Mutex::new(state),
+        };
+        pool.publish_sizes();
+        Arc::new(pool)
+    }
+
+    fn publish_sizes(&self) {
+        if let Ok(state) = self.state.lock() {
+            self.spare_size.set(state.spare.len() as f64);
+            self.cooling_size.set(state.cooling.len() as f64);
+        }
+    }
+
+    /// 取一个备用地址（先把冷却到点的放回池尾），并记为在用。
+    fn take_at(&self, now: Instant) -> Option<IpAddr> {
+        let ip = {
+            let mut state = self.state.lock().ok()?;
+            state.release_expired(now);
+            let ip = state.spare.pop_front()?;
+            *state.in_use.entry(ip).or_default() += 1;
+            ip
+        };
+        self.publish_sizes();
+        Some(ip)
+    }
+
+    fn take(&self) -> Option<IpAddr> {
+        self.take_at(Instant::now())
+    }
+
+    /// 一条 lane 不再用 `ip`。没有别的 lane 在用时：`cooldown` 为 `None` 回池尾，否则进冷却区。
+    fn release_at(&self, ip: IpAddr, cooldown: Option<Duration>, now: Instant) {
+        if let Ok(mut state) = self.state.lock() {
+            let still_used = match state.in_use.get_mut(&ip) {
+                Some(count) if *count > 1 => {
+                    *count -= 1;
+                    true
+                }
+                _ => {
+                    state.in_use.remove(&ip);
+                    false
+                }
+            };
+            if !still_used && !state.spare.contains(&ip) {
+                match cooldown {
+                    None => state.spare.push_back(ip),
+                    Some(cooldown) => {
+                        state.cooling.retain(|(cooled, _)| *cooled != ip);
+                        state.cooling.push((ip, now + cooldown));
+                    }
+                }
+            }
+        }
+        self.publish_sizes();
+    }
+
+    fn release(&self, ip: IpAddr, cooldown: Option<Duration>) {
+        self.release_at(ip, cooldown, Instant::now());
+    }
+
+    fn lane_connected(&self) {
+        self.connected_lanes.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn lane_disconnected(&self) {
+        let _ = self
+            .connected_lanes
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_sub(1));
+    }
+
+    /// 连续失败到阈值时是否换票：403 立即换；其它失败要求 `fail_after > 0`、连续失败够次数，
+    /// 且别的 lane 此刻连得上（全挂 = 中继 / 网络问题，换 IP 没用，只会把备用票全送进冷却）。
+    fn should_rotate_on_failure(&self, ip_failures: u32, forbidden: bool) -> Option<RotateReason> {
+        if self.fail_after == 0 {
+            return None;
+        }
+        if forbidden {
+            return Some(RotateReason::Forbidden);
+        }
+        (ip_failures >= self.fail_after && self.connected_lanes.load(Ordering::Relaxed) > 0)
+            .then_some(RotateReason::Failed)
+    }
+}
+
+/// 「慢」换票策略：一条绑源 IP 的 lane，滚动窗口内的中位落后（每个 seq 相对最先到的那份；自己
+/// 赢的记 0）比同一 endpoint 最快那条 lane 的中位多 ≥ `lag`，且这条 lane 已观察满一个 `window`、
+/// 样本 ≥ `min_samples`，协调器就给它换一个备用地址。`lag` 为 0 = 不做慢换票。
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct RotationPolicy {
     pub(crate) lag: Duration,
@@ -178,56 +343,183 @@ pub(crate) fn rotation_channel() -> (mpsc::Sender<IpAddr>, mpsc::Receiver<IpAddr
     mpsc::channel(1)
 }
 
-/// Rolling duplicate-lag record of one lane, kept by the coordinator.
+/// 协调器给每条 lane 记的滚动样本：(时刻, 落后 ms, 是否赢)。
 struct LaneWatch {
-    lags_ms: VecDeque<(Instant, u32)>,
+    samples: VecDeque<(Instant, u32, bool)>,
     since: Instant,
-    last_check: Instant,
+    /// 最近一条消息来自哪个源地址；变了（lane 换票了）就清空重新观察。
+    ip: Option<IpAddr>,
+    endpoint: usize,
+    metrics: Option<Arc<FeedSourceMetrics>>,
 }
 
 impl LaneWatch {
     fn new(now: Instant) -> Self {
         Self {
-            lags_ms: VecDeque::new(),
+            samples: VecDeque::new(),
             since: now,
-            last_check: now,
+            ip: None,
+            endpoint: 0,
+            metrics: None,
         }
     }
 
-    fn record(&mut self, now: Instant, lag: Duration, window: Duration) {
+    /// 记下这条消息来自的 lane 身份；源地址变了（lane 换票了）就重开观察窗口。
+    fn observe_identity(&mut self, metrics: &Arc<FeedSourceMetrics>, now: Instant) {
+        match &self.metrics {
+            Some(current) if Arc::ptr_eq(current, metrics) => return,
+            Some(_) if self.ip != metrics.local_ip => self.reset(now),
+            _ => {}
+        }
+        self.ip = metrics.local_ip;
+        self.endpoint = metrics.endpoint;
+        self.metrics = Some(metrics.clone());
+    }
+
+    fn record(&mut self, now: Instant, lag: Duration, won: bool, window: Duration) {
         let ms = lag.as_millis().min(u128::from(u32::MAX)) as u32;
-        self.lags_ms.push_back((now, ms));
-        while self
-            .lags_ms
-            .front()
-            .is_some_and(|(at, _)| now.saturating_duration_since(*at) > window)
-        {
-            self.lags_ms.pop_front();
-        }
+        self.samples.push_back((now, ms, won));
+        self.prune(now, window);
     }
 
-    /// Median duplicate lag (ms) if the lane has been slow for a full window; `None` otherwise.
-    fn slow_median(&mut self, now: Instant, policy: &RotationPolicy) -> Option<u32> {
-        if now.saturating_duration_since(self.last_check) < ROTATION_CHECK_INTERVAL {
-            return None;
-        }
-        self.last_check = now;
-        if now.saturating_duration_since(self.since) < policy.window
-            || self.lags_ms.len() < policy.min_samples
+    fn prune(&mut self, now: Instant, window: Duration) {
+        while self.samples.len() > MAX_LANE_SAMPLES
+            || self
+                .samples
+                .front()
+                .is_some_and(|(at, _, _)| now.saturating_duration_since(*at) > window)
         {
-            return None;
+            self.samples.pop_front();
         }
-        let mut sorted: Vec<u32> = self.lags_ms.iter().map(|(_, ms)| *ms).collect();
-        sorted.sort_unstable();
-        let median = sorted[sorted.len() / 2];
-        (u128::from(median) >= policy.lag.as_millis()).then_some(median)
     }
 
     fn reset(&mut self, now: Instant) {
-        self.lags_ms.clear();
+        self.samples.clear();
         self.since = now;
-        self.last_check = now;
     }
+
+    fn median_ms(&self) -> Option<u32> {
+        if self.samples.is_empty() {
+            return None;
+        }
+        let mut lags: Vec<u32> = self.samples.iter().map(|(_, ms, _)| *ms).collect();
+        let middle = lags.len() / 2;
+        Some(*lags.select_nth_unstable(middle).1)
+    }
+}
+
+/// 一条 lane 在某一时刻的排名快照。
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct LaneStat {
+    ordinal: usize,
+    endpoint: usize,
+    ip: Option<IpAddr>,
+    samples: usize,
+    wins: usize,
+    median_ms: Option<u32>,
+    /// 中位比同 endpoint 最快（已观察满窗口）那条 lane 多多少；没有可比的就是 `None`。
+    behind_best_ms: Option<u32>,
+    /// 已观察满一个窗口且样本够，才参与「最快」基准和换票判定。
+    mature: bool,
+}
+
+/// 算每条 lane 的滚动中位和「落后同 endpoint 最快 lane 多少」。只按 endpoint 内比：付费中继
+/// （`--feed-extra-url`）是另一个 endpoint，它再快也不会让公共 feed 的票全部被判慢。
+fn lane_stats(watches: &mut [LaneWatch], now: Instant, policy: &RotationPolicy) -> Vec<LaneStat> {
+    let mut stats: Vec<LaneStat> = watches
+        .iter_mut()
+        .enumerate()
+        .filter(|(_, watch)| watch.metrics.is_some())
+        .map(|(ordinal, watch)| {
+            watch.prune(now, policy.window);
+            let samples = watch.samples.len();
+            LaneStat {
+                ordinal,
+                endpoint: watch.endpoint,
+                ip: watch.ip,
+                samples,
+                wins: watch.samples.iter().filter(|(_, _, won)| *won).count(),
+                median_ms: watch.median_ms(),
+                behind_best_ms: None,
+                mature: now.saturating_duration_since(watch.since) >= policy.window
+                    && samples >= policy.min_samples.max(1),
+            }
+        })
+        .collect();
+    let mut best: BTreeMap<usize, u32> = BTreeMap::new();
+    for stat in stats.iter().filter(|stat| stat.mature) {
+        if let Some(median) = stat.median_ms {
+            best.entry(stat.endpoint)
+                .and_modify(|best| *best = (*best).min(median))
+                .or_insert(median);
+        }
+    }
+    for stat in &mut stats {
+        if let (Some(median), Some(best)) = (stat.median_ms, best.get(&stat.endpoint)) {
+            stat.behind_best_ms = Some(median.saturating_sub(*best));
+        }
+    }
+    stats
+}
+
+/// 挑一条要换的慢 lane：已观察满窗口、能换票、落后最快 lane ≥ `lag`，取落后最多的那条。
+fn pick_slow_lane(
+    stats: &[LaneStat],
+    lag: Duration,
+    rotatable: impl Fn(usize) -> bool,
+) -> Option<&LaneStat> {
+    if lag.is_zero() {
+        return None;
+    }
+    let lag_ms = lag.as_millis().min(u128::from(u32::MAX)) as u32;
+    stats
+        .iter()
+        .filter(|stat| stat.mature && rotatable(stat.ordinal))
+        .filter(|stat| stat.behind_best_ms.is_some_and(|behind| behind >= lag_ms))
+        .max_by_key(|stat| (stat.behind_best_ms, std::cmp::Reverse(stat.ordinal)))
+}
+
+/// 全局两次「慢」换票之间至少隔 [`ROTATION_GLOBAL_COOLDOWN`]。
+fn rotation_cooled(last_rotation: Option<Instant>, now: Instant) -> bool {
+    last_rotation.is_none_or(|at| now.saturating_duration_since(at) >= ROTATION_GLOBAL_COOLDOWN)
+}
+
+/// 一行 lane 排名：按 endpoint、落后多少排序，例如
+/// `#3 ep0 172.31.33.210 med=2ms +0ms win=31% n=2400 | #5 ep0 2600:… med=33ms +31ms win=0% n=2398 (warming)`。
+fn format_lane_ranking(stats: &[LaneStat]) -> String {
+    let mut sorted: Vec<&LaneStat> = stats.iter().collect();
+    sorted.sort_by_key(|stat| {
+        (
+            stat.endpoint,
+            stat.behind_best_ms.unwrap_or(u32::MAX),
+            stat.ordinal,
+        )
+    });
+    sorted
+        .iter()
+        .map(|stat| {
+            let ip = stat
+                .ip
+                .map_or_else(|| "os-selected".to_string(), |ip| ip.to_string());
+            let median = stat
+                .median_ms
+                .map_or_else(|| "-".to_string(), |ms| format!("{ms}ms"));
+            let behind = stat
+                .behind_best_ms
+                .map_or_else(|| "?".to_string(), |ms| format!("+{ms}ms"));
+            let win_pct = if stat.samples == 0 {
+                0
+            } else {
+                stat.wins * 100 / stat.samples
+            };
+            let warming = if stat.mature { "" } else { " (warming)" };
+            format!(
+                "#{} ep{} {ip} med={median} {behind} win={win_pct}% n={}{warming}",
+                stat.ordinal, stat.endpoint, stat.samples
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(" | ")
 }
 
 /// Resolve the next rotation command, or never for lanes that cannot rotate.
@@ -387,6 +679,9 @@ pub(crate) struct FeedIngress {
 
 #[derive(Clone)]
 struct FeedSourceMetrics {
+    /// lane 身份（不是指标）：协调器按它识别换票、按 endpoint 分组排名。
+    endpoint: usize,
+    local_ip: Option<IpAddr>,
     connected: Gauge,
     connection_attempts: Counter,
     connections: Counter,
@@ -398,6 +693,10 @@ struct FeedSourceMetrics {
     stale: Counter,
     coordinator_delay: Histogram,
     duplicate_lag: Histogram,
+    /// 滚动窗口内的中位落后（ms，赢的记 0），协调器每 5 秒更新。
+    lag_median_ms: Gauge,
+    /// 中位比同 endpoint 最快 lane 多多少（ms）；还没有可比的 lane 时不更新。
+    lag_behind_best_ms: Gauge,
 }
 
 impl FeedSourceMetrics {
@@ -418,6 +717,8 @@ impl FeedSourceMetrics {
             };
         }
         Self {
+            endpoint: source.endpoint,
+            local_ip: source.local_ip,
             connected: metric!(gauge, "arb_reth.feed.source_connected"),
             connection_attempts: metric!(counter, "arb_reth.feed.source_connection_attempts_total"),
             connections: metric!(counter, "arb_reth.feed.source_connections_total"),
@@ -429,6 +730,8 @@ impl FeedSourceMetrics {
             stale: metric!(counter, "arb_reth.feed.source_stale_total"),
             coordinator_delay: metric!(histogram, "arb_reth.feed.source_coordinator_delay_seconds"),
             duplicate_lag: metric!(histogram, "arb_reth.feed.source_duplicate_lag_seconds"),
+            lag_median_ms: metric!(gauge, "arb_reth.feed.source_lag_median_ms"),
+            lag_behind_best_ms: metric!(gauge, "arb_reth.feed.source_lag_behind_best_ms"),
         }
     }
 }
@@ -512,13 +815,26 @@ pub(crate) async fn coordinate(
 ) {
     let mut race = SequenceRace::new(resume_sequence.load(Ordering::Acquire));
     let started = Instant::now();
-    let lane_count = rotation.as_ref().map_or(0, |r| r.lanes.len());
-    let mut watches: Vec<LaneWatch> = (0..lane_count).map(|_| LaneWatch::new(started)).collect();
+    // 排名窗口：有换票就用换票策略的窗口；没开换票（没有备用地址）也照样统计、打排名日志。
+    let policy = rotation.as_ref().map_or(
+        RotationPolicy {
+            lag: Duration::ZERO,
+            window: DEFAULT_RANKING_WINDOW,
+            min_samples: DEFAULT_RANKING_MIN_SAMPLES,
+        },
+        |rotation| rotation.policy,
+    );
+    let mut watches: Vec<LaneWatch> = Vec::new();
     let mut last_rotation: Option<Instant> = None;
+    let mut next_check = started + ROTATION_CHECK_INTERVAL;
+    let mut next_report = started + LANE_REPORT_INTERVAL;
     while let Some(item) = ingress.recv().await {
         let sequence = item.message.sequence_number;
+        // 这条 lane 在这个 seq 上落后最先到那份多少（自己赢 = 0）；重复但赢家时刻未知 / 过期不记。
+        let mut sample: Option<(Duration, bool)> = None;
         match race.observe(sequence, item.ready_for_channel_at) {
             Observation::First => {
+                sample = Some((Duration::ZERO, true));
                 item.metrics.wins.increment(1);
                 item.metrics.coordinator_delay.record(
                     Instant::now()
@@ -575,39 +891,82 @@ pub(crate) async fn coordinate(
                         .ready_for_channel_at
                         .saturating_duration_since(winner_ready_at);
                     item.metrics.duplicate_lag.record(lag.as_secs_f64());
-                    if let (Some(rotation), Some(watch)) =
-                        (rotation.as_mut(), watches.get_mut(item.ordinal))
-                    {
-                        let now = Instant::now();
-                        watch.record(now, lag, rotation.policy.window);
-                        let cooled = last_rotation.is_none_or(|at| {
-                            now.saturating_duration_since(at) >= ROTATION_GLOBAL_COOLDOWN
-                        });
-                        if let Some(median) = watch.slow_median(now, &rotation.policy)
-                            && cooled
-                            && let Some(Some(lane)) = rotation.lanes.get(item.ordinal)
-                            && let Some(new_ip) = rotation.pool.take()
-                        {
-                            match lane.try_send(new_ip) {
-                                Ok(()) => {
-                                    rotation.pool.rotations.increment(1);
-                                    last_rotation = Some(now);
-                                    watch.reset(now);
-                                    reth_tracing::tracing::info!(
-                                        target: "arb-reth",
-                                        lane = item.ordinal,
-                                        median_lag_ms = median,
-                                        new_ip = %new_ip,
-                                        "feed: rotating persistently slow lane onto a spare source address"
-                                    );
-                                }
-                                Err(_) => rotation.pool.give_back(new_ip),
-                            }
-                        }
-                    }
+                    sample = Some((lag, false));
                 }
             }
             Observation::Stale => item.metrics.stale.increment(1),
+        }
+
+        // 以下全在首份已经交给引擎之后做：记样本、每 5 秒排名 / 换票、每 10 分钟打一行排名。
+        let now = Instant::now();
+        if let Some((lag, won)) = sample {
+            if watches.len() <= item.ordinal {
+                watches.resize_with(item.ordinal + 1, || LaneWatch::new(started));
+            }
+            let watch = &mut watches[item.ordinal];
+            watch.observe_identity(&item.metrics, now);
+            watch.record(now, lag, won, policy.window);
+        }
+        if now < next_check {
+            continue;
+        }
+        next_check = now + ROTATION_CHECK_INTERVAL;
+        let stats = lane_stats(&mut watches, now, &policy);
+        for stat in &stats {
+            if let Some(metrics) = watches[stat.ordinal].metrics.as_ref() {
+                if let Some(median) = stat.median_ms {
+                    metrics.lag_median_ms.set(f64::from(median));
+                }
+                if let Some(behind) = stat.behind_best_ms {
+                    metrics.lag_behind_best_ms.set(f64::from(behind));
+                }
+            }
+        }
+        if now >= next_report {
+            next_report = now + LANE_REPORT_INTERVAL;
+            reth_tracing::tracing::info!(
+                target: "arb-reth",
+                window_secs = policy.window.as_secs(),
+                lanes = %format_lane_ranking(&stats),
+                "feed: lane ranking"
+            );
+        }
+        let Some(rotation) = rotation.as_mut() else {
+            continue;
+        };
+        if !rotation_cooled(last_rotation, now) {
+            continue;
+        }
+        let Some(slow) = pick_slow_lane(&stats, rotation.policy.lag, |ordinal| {
+            matches!(rotation.lanes.get(ordinal), Some(Some(_)))
+        }) else {
+            continue;
+        };
+        let Some(Some(lane)) = rotation.lanes.get(slow.ordinal) else {
+            continue;
+        };
+        let Some(new_ip) = rotation.pool.take() else {
+            continue;
+        };
+        match lane.try_send(new_ip) {
+            Ok(()) => {
+                rotation.pool.rotations.increment(1);
+                last_rotation = Some(now);
+                watches[slow.ordinal].reset(now);
+                reth_tracing::tracing::info!(
+                    target: "arb-reth",
+                    lane = slow.ordinal,
+                    reason = RotateReason::Slow.as_str(),
+                    old_ip = ?slow.ip,
+                    new_ip = %new_ip,
+                    median_lag_ms = slow.median_ms.unwrap_or_default(),
+                    behind_best_ms = slow.behind_best_ms.unwrap_or_default(),
+                    threshold_ms = rotation.policy.lag.as_millis() as u64,
+                    "feed: rotating slow lane onto a spare source address"
+                );
+            }
+            // 这条 lane 此刻没连着（命令通道里已有一条没取走）：地址原样回池。
+            Err(_) => rotation.pool.release(new_ip, None),
         }
     }
 }
@@ -628,6 +987,8 @@ pub(crate) async fn follow(
     };
     let mut metrics = Arc::new(FeedSourceMetrics::new(&source));
     let mut consecutive_failures = 0u32;
+    // 当前源 IP 连续失败次数（不算 429：那是连接数上限，按原退避等）；换 IP 或收到消息就清零。
+    let mut ip_failures = 0u32;
     // Spread the initial handshake burst. Several public relays rate-limit simultaneous upgrades
     // even when they are willing to keep the same number of established sockets open.
     tokio::time::sleep(initial_connect_delay(source.ordinal)).await;
@@ -651,11 +1012,15 @@ pub(crate) async fn follow(
         metrics.connection_attempts.increment(1);
         let mut pushed = 0usize;
         let mut rate_limited = false;
+        let mut forbidden = false;
         let mut rotate_to: Option<IpAddr> = None;
         match connect_source(&source, request).await {
             Ok((mut websocket, response)) => {
                 metrics.connected.set(1.0);
                 metrics.connections.increment(1);
+                if let Some(pool) = pool.as_ref() {
+                    pool.lane_connected();
+                }
                 // 服务端同意的压缩扩展（没报价或没同意就是 none）。tungstenite 补丁按同一个头启用解压。
                 let compression = response
                     .headers()
@@ -734,6 +1099,9 @@ pub(crate) async fn follow(
                         };
                         if ingress.send(item).await.is_err() {
                             metrics.connected.set(0.0);
+                            if let Some(pool) = pool.as_ref() {
+                                pool.lane_disconnected();
+                            }
                             return;
                         }
                         pushed += 1;
@@ -742,6 +1110,9 @@ pub(crate) async fn follow(
 
                 metrics.connected.set(0.0);
                 metrics.disconnects.increment(1);
+                if let Some(pool) = pool.as_ref() {
+                    pool.lane_disconnected();
+                }
                 reth_tracing::tracing::warn!(
                     target: "arb-reth",
                     endpoint = source.endpoint,
@@ -752,6 +1123,7 @@ pub(crate) async fn follow(
             }
             Err(err) => {
                 rate_limited = is_rate_limited(&err);
+                forbidden = is_forbidden(&err);
                 metrics.connected.set(0.0);
                 metrics.errors.increment(1);
                 reth_tracing::tracing::warn!(
@@ -759,7 +1131,9 @@ pub(crate) async fn follow(
                     endpoint = source.endpoint,
                     connection = source.connection,
                     relay = %source.display_endpoint,
+                    local_ip = ?source.local_ip,
                     rate_limited,
+                    forbidden,
                     err = %err,
                     "feed: connection failed"
                 );
@@ -769,31 +1143,86 @@ pub(crate) async fn follow(
         if let Some(new_ip) = rotate_to {
             // Re-deal this lane's relay ticket: rebind to the spare address, return the old one to
             // the pool, and reconnect at once (no failure backoff: nothing failed).
-            let old_ip = source.local_ip.replace(new_ip);
-            if let (Some(pool), Some(old_ip)) = (pool.as_ref(), old_ip) {
-                pool.give_back(old_ip);
-            }
-            metrics = Arc::new(FeedSourceMetrics::new(&source));
-            reth_tracing::tracing::info!(
-                target: "arb-reth",
-                endpoint = source.endpoint,
-                connection = source.connection,
-                old_ip = ?old_ip,
-                new_ip = %new_ip,
-                "feed: lane rebound to a spare source address; reconnecting"
+            rebind_lane(
+                &mut source,
+                &mut metrics,
+                pool.as_deref(),
+                new_ip,
+                RotateReason::Slow,
             );
             consecutive_failures = 0;
+            ip_failures = 0;
             continue;
         }
 
-        consecutive_failures = if pushed == 0 {
-            consecutive_failures.saturating_add(1)
+        if pushed == 0 {
+            consecutive_failures = consecutive_failures.saturating_add(1);
+            if !rate_limited {
+                ip_failures = ip_failures.saturating_add(1);
+            }
         } else {
-            0
-        };
-        let delay = reconnect_delay(consecutive_failures, source.ordinal, rate_limited);
+            consecutive_failures = 0;
+            ip_failures = 0;
+        }
+
+        // 连接失败换票：403 立即换；同一 IP 连续失败 `--feed-rotate-fail-after` 次且别的 lane
+        // 连得上才换。被换下的 IP 进冷却（失败 30 分钟、403 六小时），不再每几秒打一次握手。
+        if let (Some(pool), true) = (pool.as_ref(), source.is_bound() && pushed == 0) {
+            if let Some(reason) = pool.should_rotate_on_failure(ip_failures, forbidden) {
+                if let Some(new_ip) = pool.take() {
+                    pool.failure_rotations.increment(1);
+                    rebind_lane(&mut source, &mut metrics, Some(&**pool), new_ip, reason);
+                    consecutive_failures = 0;
+                    ip_failures = 0;
+                    tokio::time::sleep(reconnect_delay(1, source.ordinal, false)).await;
+                    continue;
+                }
+                if ip_failures == pool.fail_after || forbidden {
+                    reth_tracing::tracing::warn!(
+                        target: "arb-reth",
+                        endpoint = source.endpoint,
+                        connection = source.connection,
+                        local_ip = ?source.local_ip,
+                        reason = reason.as_str(),
+                        "feed: lane should rotate but no spare source address is free; retrying the same address"
+                    );
+                }
+            }
+        }
+
+        // 403 与 429 一样走长退避（30 秒起、最长 5 分钟）：每几秒重试一次被封的 IP 只会被封得更久。
+        let delay = reconnect_delay(
+            consecutive_failures,
+            source.ordinal,
+            rate_limited || forbidden,
+        );
         tokio::time::sleep(delay).await;
     }
+}
+
+/// 把 lane 换到 `new_ip`：旧地址按换票原因回池尾或进冷却，指标换成新地址的标签。
+fn rebind_lane(
+    source: &mut FeedSource,
+    metrics: &mut Arc<FeedSourceMetrics>,
+    pool: Option<&RotationPool>,
+    new_ip: IpAddr,
+    reason: RotateReason,
+) {
+    let old_ip = source.local_ip.replace(new_ip);
+    if let (Some(pool), Some(old_ip)) = (pool, old_ip) {
+        pool.release(old_ip, reason.cooldown());
+    }
+    *metrics = Arc::new(FeedSourceMetrics::new(source));
+    reth_tracing::tracing::info!(
+        target: "arb-reth",
+        endpoint = source.endpoint,
+        connection = source.connection,
+        reason = reason.as_str(),
+        old_ip = ?old_ip,
+        new_ip = %new_ip,
+        old_ip_cooldown_secs = reason.cooldown().map_or(0, |cooldown| cooldown.as_secs()),
+        "feed: lane rebound to a spare source address; reconnecting"
+    );
 }
 
 type FeedWebSocket = WebSocketStream<MaybeTlsStream<TcpStream>>;
@@ -902,6 +1331,11 @@ fn initial_connect_delay(ordinal: usize) -> Duration {
 
 fn is_rate_limited(err: &WebSocketError) -> bool {
     matches!(err, WebSocketError::Http(response) if response.status() == StatusCode::TOO_MANY_REQUESTS)
+}
+
+/// 403：Cloudflare 把这个源 IP 封了（闲置机实测几十万次失败握手之后）。
+fn is_forbidden(err: &WebSocketError) -> bool {
+    matches!(err, WebSocketError::Http(response) if response.status() == StatusCode::FORBIDDEN)
 }
 
 fn reconnect_delay(failures: u32, ordinal: usize, rate_limited: bool) -> Duration {
@@ -1098,35 +1532,360 @@ mod tests {
         assert!(reconnect_delay(100, 0, true) <= MAX_RATE_LIMIT_DELAY);
     }
 
-    #[test]
-    fn rotation_waits_for_enough_recent_samples_and_resets_its_window() {
-        let started = Instant::now();
-        let policy = RotationPolicy {
-            lag: Duration::from_millis(30),
-            window: Duration::from_secs(60),
-            min_samples: 3,
-        };
-        let mut watch = LaneWatch::new(started);
-        let sample_at = started + policy.window;
-        watch.record(sample_at, Duration::from_millis(40), policy.window);
-        watch.record(sample_at, Duration::from_millis(50), policy.window);
-        assert_eq!(watch.slow_median(sample_at, &policy), None);
-        let ready_at = sample_at + ROTATION_CHECK_INTERVAL;
-        watch.record(ready_at, Duration::from_millis(45), policy.window);
-        assert_eq!(watch.slow_median(ready_at, &policy), Some(45));
+    fn ip(raw: &str) -> IpAddr {
+        raw.parse().unwrap()
+    }
 
-        watch.reset(ready_at);
-        for _ in 0..3 {
-            watch.record(ready_at, Duration::from_millis(40), policy.window);
+    /// 造一条 lane 的身份（endpoint / 源地址），喂给 LaneWatch。
+    fn lane_metrics(
+        ordinal: usize,
+        endpoint: usize,
+        local_ip: Option<IpAddr>,
+    ) -> Arc<FeedSourceMetrics> {
+        Arc::new(FeedSourceMetrics::new(&FeedSource {
+            ordinal,
+            endpoint,
+            connection: ordinal,
+            url: "wss://example.com/feed".into(),
+            display_endpoint: "wss://example.com".into(),
+            local_ip,
+            deflate: false,
+        }))
+    }
+
+    /// 在 [from, to) 里每 100 ms 给 lane 记一个样本，落后 `lag_ms`（0 记为赢）。
+    fn feed_lane(watch: &mut LaneWatch, from: Instant, to: Instant, lag_ms: u64, window: Duration) {
+        let mut at = from;
+        while at < to {
+            watch.record(at, Duration::from_millis(lag_ms), lag_ms == 0, window);
+            at += Duration::from_millis(100);
         }
+    }
+
+    fn test_policy() -> RotationPolicy {
+        RotationPolicy {
+            lag: Duration::from_millis(8),
+            window: Duration::from_secs(240),
+            min_samples: 200,
+        }
+    }
+
+    #[test]
+    fn ranking_rotates_only_the_lane_persistently_behind_the_fastest_lane() {
+        let started = Instant::now();
+        let policy = test_policy();
+        // 0–2：公共 feed（endpoint 0）的三张票；3：付费中继（endpoint 1），永远最快，不该拖累排名。
+        let lanes = [
+            (0, Some(ip("192.0.2.10")), 20),
+            (0, Some(ip("192.0.2.11")), 25),
+            (0, Some(ip("192.0.2.12")), 33),
+            (1, None, 0),
+        ];
+        let mut watches: Vec<LaneWatch> =
+            (0..lanes.len()).map(|_| LaneWatch::new(started)).collect();
+        let half = started + policy.window / 2;
+        for (ordinal, (endpoint, local_ip, lag_ms)) in lanes.iter().enumerate() {
+            watches[ordinal]
+                .observe_identity(&lane_metrics(ordinal, *endpoint, *local_ip), started);
+            feed_lane(&mut watches[ordinal], started, half, *lag_ms, policy.window);
+        }
+        let rotatable = |ordinal: usize| ordinal < 3;
+
+        // 不满一个窗口：谁都不换，排名里标 warming。
+        let stats = lane_stats(&mut watches, half, &policy);
+        assert!(stats.iter().all(|stat| !stat.mature));
+        assert_eq!(pick_slow_lane(&stats, policy.lag, rotatable), None);
+        assert!(format_lane_ranking(&stats).contains("(warming)"));
+
+        let full = started + policy.window;
+        for (ordinal, (_, _, lag_ms)) in lanes.iter().enumerate() {
+            feed_lane(&mut watches[ordinal], half, full, *lag_ms, policy.window);
+        }
+        let stats = lane_stats(&mut watches, full, &policy);
+        let behind: Vec<_> = stats.iter().map(|stat| stat.behind_best_ms).collect();
+        assert_eq!(behind, [Some(0), Some(5), Some(13), Some(0)]);
+        let slow = pick_slow_lane(&stats, policy.lag, rotatable).unwrap();
+        assert_eq!((slow.ordinal, slow.median_ms), (2, Some(33)));
         assert_eq!(
-            watch.slow_median(ready_at + ROTATION_CHECK_INTERVAL, &policy),
-            None,
-            "a rotated lane must receive a full new observation window"
+            stats[3].wins, stats[3].samples,
+            "the paid lane won every sequence"
         );
-        let expired_at = ready_at + policy.window + Duration::from_secs(1);
-        watch.record(expired_at, Duration::from_millis(40), policy.window);
-        assert_eq!(watch.slow_median(expired_at, &policy), None);
+        let ranking = format_lane_ranking(&stats);
+        assert!(
+            ranking.starts_with("#0 ep0 192.0.2.10 med=20ms +0ms"),
+            "{ranking}"
+        );
+        assert!(
+            ranking.contains("#2 ep0 192.0.2.12 med=33ms +13ms win=0%"),
+            "{ranking}"
+        );
+
+        // 5 ms 的差距在 8 ms 阈值以下；不能换票的 lane 再慢也不挑；阈值 0 = 关掉慢换票。
+        assert_eq!(
+            pick_slow_lane(&stats, policy.lag, |ordinal| ordinal == 1),
+            None
+        );
+        assert_eq!(pick_slow_lane(&stats, policy.lag, |_| false), None);
+        assert_eq!(pick_slow_lane(&stats, Duration::ZERO, rotatable), None);
+        assert_eq!(
+            pick_slow_lane(&stats, Duration::from_millis(5), rotatable)
+                .unwrap()
+                .ordinal,
+            2,
+            "the worst lane goes first"
+        );
+    }
+
+    #[test]
+    fn a_rotated_lane_gets_a_fresh_window_and_old_samples_expire() {
+        let started = Instant::now();
+        let policy = test_policy();
+        let mut watches = vec![LaneWatch::new(started), LaneWatch::new(started)];
+        let full = started + policy.window;
+        watches[0].observe_identity(&lane_metrics(0, 0, Some(ip("192.0.2.10"))), started);
+        watches[1].observe_identity(&lane_metrics(1, 0, Some(ip("192.0.2.11"))), started);
+        feed_lane(&mut watches[0], started, full, 0, policy.window);
+        feed_lane(&mut watches[1], started, full, 30, policy.window);
+        let stats = lane_stats(&mut watches, full, &policy);
+        assert_eq!(
+            pick_slow_lane(&stats, policy.lag, |_| true)
+                .unwrap()
+                .ordinal,
+            1
+        );
+
+        // 换票后第一条消息来自新地址：观察窗口清零重来，满窗口前不会再被换。
+        let later = full + Duration::from_secs(1);
+        watches[1].observe_identity(&lane_metrics(1, 0, Some(ip("192.0.2.99"))), later);
+        assert!(watches[1].samples.is_empty());
+        feed_lane(
+            &mut watches[0],
+            full,
+            later + policy.window / 2,
+            0,
+            policy.window,
+        );
+        feed_lane(
+            &mut watches[1],
+            later,
+            later + policy.window / 2,
+            30,
+            policy.window,
+        );
+        let stats = lane_stats(&mut watches, later + policy.window / 2, &policy);
+        assert!(!stats[1].mature);
+        assert_eq!(stats[1].ip, Some(ip("192.0.2.99")));
+        assert_eq!(pick_slow_lane(&stats, policy.lag, |_| true), None);
+
+        // 同一个地址的重连（同一份 metrics）不清样本。
+        let same = watches[0].metrics.clone().unwrap();
+        let before = watches[0].samples.len();
+        watches[0].observe_identity(&same, later);
+        assert_eq!(watches[0].samples.len(), before);
+
+        // 断线的 lane 不再来样本：窗口过去后样本全过期，不参与排名也不当基准。
+        let gone = later + policy.window * 3;
+        let stats = lane_stats(&mut watches, gone, &policy);
+        assert!(stats.iter().all(|stat| stat.samples == 0 && !stat.mature));
+    }
+
+    #[test]
+    fn slow_rotations_keep_a_global_floor() {
+        let now = Instant::now();
+        assert!(rotation_cooled(None, now));
+        assert!(!rotation_cooled(
+            Some(now),
+            now + ROTATION_GLOBAL_COOLDOWN / 2
+        ));
+        assert!(rotation_cooled(Some(now), now + ROTATION_GLOBAL_COOLDOWN));
+    }
+
+    fn bound_sources(ips: &[&str]) -> Vec<FeedSource> {
+        let specs: Vec<FeedSourceSpec> = ips
+            .iter()
+            .map(|raw| FeedSourceSpec {
+                local_ip: ip(raw),
+                connections: 1,
+            })
+            .collect();
+        expand_feed_sources(&["wss://example.com/feed".into()], None, &specs).unwrap()
+    }
+
+    fn spare_of(pool: &RotationPool) -> Vec<IpAddr> {
+        pool.state.lock().unwrap().spare.iter().copied().collect()
+    }
+
+    #[test]
+    fn pool_ignores_spares_already_in_use_and_duplicates_and_accepts_ipv4() {
+        let sources = bound_sources(&["192.0.2.10", "2001:db8::1"]);
+        let pool = RotationPool::new(
+            vec![
+                ip("192.0.2.10"),
+                ip("192.0.2.20"),
+                ip("2001:db8::2"),
+                ip("192.0.2.20"),
+            ],
+            &sources,
+            3,
+        );
+        assert_eq!(spare_of(&pool), [ip("192.0.2.20"), ip("2001:db8::2")]);
+    }
+
+    #[test]
+    fn slow_rotation_returns_the_old_ip_to_the_tail_and_shared_ips_stay_out() {
+        // 192.0.2.10 被两条 lane 用着（=2 条连接）。
+        let specs = [FeedSourceSpec {
+            local_ip: ip("192.0.2.10"),
+            connections: 2,
+        }];
+        let sources =
+            expand_feed_sources(&["wss://example.com/feed".into()], None, &specs).unwrap();
+        let pool = RotationPool::new(vec![ip("192.0.2.20"), ip("192.0.2.21")], &sources, 3);
+        let now = Instant::now();
+
+        assert_eq!(pool.take_at(now), Some(ip("192.0.2.20")));
+        pool.release_at(ip("192.0.2.10"), RotateReason::Slow.cooldown(), now);
+        assert_eq!(
+            spare_of(&pool),
+            [ip("192.0.2.21")],
+            "another lane still uses 192.0.2.10"
+        );
+
+        assert_eq!(pool.take_at(now), Some(ip("192.0.2.21")));
+        pool.release_at(ip("192.0.2.10"), RotateReason::Slow.cooldown(), now);
+        assert_eq!(
+            spare_of(&pool),
+            [ip("192.0.2.10")],
+            "last user gone: back to the tail"
+        );
+    }
+
+    #[test]
+    fn failed_and_forbidden_ips_cool_down_before_returning() {
+        let sources = bound_sources(&["192.0.2.10", "192.0.2.11"]);
+        let pool = RotationPool::new(vec![ip("192.0.2.20"), ip("192.0.2.21")], &sources, 3);
+        let now = Instant::now();
+
+        assert_eq!(pool.take_at(now), Some(ip("192.0.2.20")));
+        pool.release_at(ip("192.0.2.10"), RotateReason::Failed.cooldown(), now);
+        assert_eq!(pool.take_at(now), Some(ip("192.0.2.21")));
+        pool.release_at(ip("192.0.2.11"), RotateReason::Forbidden.cooldown(), now);
+        assert_eq!(pool.take_at(now), None, "both old addresses are cooling");
+        assert_eq!(pool.state.lock().unwrap().cooling.len(), 2);
+
+        let failed_back = now + FAILED_IP_COOLDOWN;
+        assert_eq!(pool.take_at(failed_back), Some(ip("192.0.2.10")));
+        assert_eq!(
+            pool.take_at(failed_back),
+            None,
+            "403 cools longer than a plain failure"
+        );
+        assert_eq!(
+            pool.take_at(now + FORBIDDEN_IP_COOLDOWN),
+            Some(ip("192.0.2.11"))
+        );
+        assert!(pool.state.lock().unwrap().cooling.is_empty());
+    }
+
+    #[test]
+    fn failure_rotation_needs_a_streak_and_a_live_relay_but_403_rotates_at_once() {
+        let sources = bound_sources(&["192.0.2.10"]);
+        let pool = RotationPool::new(vec![ip("192.0.2.20")], &sources, 3);
+        assert_eq!(
+            pool.should_rotate_on_failure(1, true),
+            Some(RotateReason::Forbidden)
+        );
+        assert_eq!(
+            pool.should_rotate_on_failure(3, false),
+            None,
+            "no lane connected: relay down"
+        );
+        pool.lane_connected();
+        assert_eq!(pool.should_rotate_on_failure(2, false), None);
+        assert_eq!(
+            pool.should_rotate_on_failure(3, false),
+            Some(RotateReason::Failed)
+        );
+        pool.lane_disconnected();
+        pool.lane_disconnected();
+        assert_eq!(
+            pool.connected_lanes.load(Ordering::Relaxed),
+            0,
+            "never underflows"
+        );
+
+        let off = RotationPool::new(vec![ip("192.0.2.20")], &sources, 0);
+        off.lane_connected();
+        assert_eq!(off.should_rotate_on_failure(100, false), None);
+        assert_eq!(
+            off.should_rotate_on_failure(1, true),
+            None,
+            "0 turns failure rotation off"
+        );
+    }
+
+    #[test]
+    fn forbidden_backs_off_like_rate_limiting() {
+        let response = tokio_tungstenite::tungstenite::http::Response::builder()
+            .status(StatusCode::FORBIDDEN)
+            .body(None::<Vec<u8>>)
+            .unwrap();
+        let err = WebSocketError::Http(Box::new(response));
+        assert!(is_forbidden(&err));
+        assert!(!is_rate_limited(&err));
+    }
+
+    /// 一个只回 403 的中继：lane 应该立刻换到备用地址重连，旧地址进 6 小时冷却。
+    #[tokio::test]
+    async fn a_forbidden_lane_rotates_onto_a_spare_and_cools_the_old_ip() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            for _ in 0..2 {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut buf = [0u8; 4096];
+                let _ = stream.read(&mut buf).await.unwrap();
+                stream
+                    .write_all(
+                        b"HTTP/1.1 403 Forbidden\r\ncontent-length: 0\r\nconnection: close\r\n\r\n",
+                    )
+                    .await
+                    .unwrap();
+            }
+        });
+        let source = FeedSource {
+            ordinal: 0,
+            endpoint: 0,
+            connection: 0,
+            url: format!("ws://{address}"),
+            display_endpoint: format!("ws://{address}"),
+            local_ip: Some(ip("127.0.0.1")),
+            deflate: false,
+        };
+        // 备用地址用 0.0.0.0（未指定地址，任何机器上都能 bind），足够验证换票与冷却。
+        let pool = RotationPool::new(vec![ip("0.0.0.0")], std::slice::from_ref(&source), 3);
+        let (ingress_tx, _ingress_rx) = ingress_channel();
+        let (_rotate_tx, rotate_rx) = rotation_channel();
+        let lane = tokio::spawn(follow(
+            source,
+            ingress_tx,
+            Arc::new(AtomicU64::new(1)),
+            Some((pool.clone(), rotate_rx)),
+        ));
+
+        // 没换票时 403 走 30 秒退避；两次握手能在 5 秒内到齐，只可能是换票后立即重连。
+        tokio::time::timeout(Duration::from_secs(5), server)
+            .await
+            .expect("the lane reconnects on the spare address without the 403 backoff")
+            .unwrap();
+        lane.abort();
+        let state = pool.state.lock().unwrap();
+        assert!(state.spare.is_empty());
+        assert_eq!(state.cooling.len(), 1);
+        assert_eq!(state.cooling[0].0, ip("127.0.0.1"));
+        assert!(state.cooling[0].1 > Instant::now() + FAILED_IP_COOLDOWN);
     }
 
     #[tokio::test]

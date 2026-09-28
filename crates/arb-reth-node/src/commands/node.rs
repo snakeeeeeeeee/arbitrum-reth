@@ -228,24 +228,39 @@ pub struct ArbNodeArgs {
     #[arg(long = "feed-extra-connections", value_name = "COUNT", default_value_t = 1)]
     feed_extra_connections: usize,
 
-    /// Spare local source addresses. A source-bound lane whose duplicate lag (behind the winning
-    /// lane) stays at or above `--feed-rotate-lag-ms` for a whole `--feed-rotate-window-secs` is
-    /// rebound to the next spare; its old address returns to the pool. The relay assigns replicas
-    /// per source IP, so each address is an independent lottery ticket.
+    /// 备用源地址（IPv4 / IPv6 都行，可重复）。中继按源 IP 分配后端副本，每个地址是一张独立
+    /// 抽签票。绑源 IP 的 lane 在两种情况下换到下一个备用地址重连：
+    /// 慢 —— 滚动中位落后同 relay 最快 lane ≥ `--feed-rotate-lag-ms`，观察满
+    /// `--feed-rotate-window-secs`（旧地址回池尾；全局两次慢换票至少隔 60 秒）；
+    /// 失败 —— 收到 403，或同一地址连续失败 `--feed-rotate-fail-after` 次（不算 429）且别的 lane
+    /// 连得上（旧地址冷却 30 分钟，403 冷却 6 小时后才回池）。与 `--feed-source` 重复的地址忽略。
+    /// 不给这个参数 = 不换票（排名日志照打）。
     #[arg(long = "feed-spare-ip", value_name = "IP", action = clap::ArgAction::Append)]
     feed_spare_ips: Vec<std::net::IpAddr>,
 
-    /// Rolling median duplicate lag, in milliseconds, at or above which a lane is rotated.
-    #[arg(long = "feed-rotate-lag-ms", value_name = "MS", default_value_t = 30)]
+    /// 慢换票阈值（毫秒）：lane 的滚动中位落后（每个 seq 相对最先到的那份，赢了记 0）比同一
+    /// relay 最快 lane 的中位多出这么多就换。0 = 不做慢换票。09-28 前的语义是「落后赢家的绝对
+    /// 中位」、默认 30；实测好票与普通票差 10–15 ms，30 永远不触发，改为相对最快 lane、默认 8。
+    #[arg(long = "feed-rotate-lag-ms", value_name = "MS", default_value_t = 8)]
     feed_rotate_lag_ms: u64,
 
-    /// Seconds a lane must stay slow before it rotates; also its cooldown after a rotation.
+    /// 慢换票窗口（秒）：滚动中位按最近这么久算，lane 须观察满一个窗口（换票后重新计）才可能
+    /// 被换。同时是 `feed: lane ranking` 日志的统计窗口。
     #[arg(
         long = "feed-rotate-window-secs",
         value_name = "SECS",
-        default_value_t = 600
+        default_value_t = 240
     )]
     feed_rotate_window_secs: u64,
+
+    /// 同一源地址连续失败几次（不算 429）就换到备用地址；403 立即换。0 = 不因失败换票
+    /// （老行为；但 403 仍按 429 的长退避重试）。只在有 `--feed-spare-ip` 时生效。
+    #[arg(
+        long = "feed-rotate-fail-after",
+        value_name = "COUNT",
+        default_value_t = 3
+    )]
+    feed_rotate_fail_after: u32,
 
     /// 握手时报 WebSocket 压缩扩展 permessage-deflate，服务端同意就在节点里解压（RFC 7692）。
     /// 官方 feed 自 2026-09-17 起不带压缩报价一律 400，打开它才能不经解压中继直连。对所有 lane
@@ -915,7 +930,11 @@ async fn launch(
                 }
             }
             feed::Rotation {
-                pool: feed::RotationPool::new(args.feed_spare_ips.clone()),
+                pool: feed::RotationPool::new(
+                    args.feed_spare_ips.clone(),
+                    &feed_sources,
+                    args.feed_rotate_fail_after,
+                ),
                 policy: feed::RotationPolicy {
                     lag: std::time::Duration::from_millis(args.feed_rotate_lag_ms),
                     window: std::time::Duration::from_secs(args.feed_rotate_window_secs),
@@ -1283,9 +1302,13 @@ mod tests {
         assert_eq!(command.ext.feed_connections, Some(3));
         assert!(command.ext.feed_sources.is_empty());
         assert!(command.ext.feed_spare_ips.is_empty());
-        assert_eq!(command.ext.feed_rotate_lag_ms, 30);
-        assert_eq!(command.ext.feed_rotate_window_secs, 600);
-        assert!(!command.ext.feed_deflate, "--feed-deflate defaults off (relay-shim era behaviour)");
+        assert_eq!(command.ext.feed_rotate_lag_ms, 8);
+        assert_eq!(command.ext.feed_rotate_window_secs, 240);
+        assert_eq!(command.ext.feed_rotate_fail_after, 3);
+        assert!(
+            !command.ext.feed_deflate,
+            "--feed-deflate defaults off (relay-shim era behaviour)"
+        );
     }
 
     #[test]
@@ -1307,6 +1330,8 @@ mod tests {
             "45",
             "--feed-rotate-window-secs",
             "900",
+            "--feed-rotate-fail-after",
+            "5",
             "--feed-deflate",
             "--mev-tx-log-ipc",
             "/tmp/mev-tx-logs.sock",
@@ -1330,6 +1355,7 @@ mod tests {
         );
         assert_eq!(command.ext.feed_rotate_lag_ms, 45);
         assert_eq!(command.ext.feed_rotate_window_secs, 900);
+        assert_eq!(command.ext.feed_rotate_fail_after, 5);
         assert!(command.ext.feed_deflate);
         assert_eq!(
             command.ext.mev_tx_log_ipc,
